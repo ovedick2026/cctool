@@ -1,0 +1,1102 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Code Tool Bridge</title>
+
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b1020;
+        --panel: #141c31;
+        --panel2: #0e1528;
+        --panel3: #0a1122;
+        --border: #2d3a5c;
+        --border2: #1d2742;
+        --text: #e8edf9;
+        --muted: #9daccc;
+        --dim: #6b7a9c;
+        --primary: #6ea8fe;
+        --ok: #77e2a0;
+        --warn: #ffc46b;
+        --danger: #ff7a90;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        max-width: 1600px;
+        margin: 0 auto;
+        padding: 16px;
+        background: var(--bg);
+        color: var(--text);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", monospace;
+        font-size: 13px;
+      }
+
+      h1 { margin: 0 0 12px; font-size: 18px; }
+      h2 { margin: 0 0 10px; font-size: 15px; }
+
+      .panel {
+        margin-bottom: 14px;
+        padding: 14px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+      }
+
+      .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      .grow { flex: 1 1 auto; }
+
+      input, textarea, select, button {
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        font: inherit;
+      }
+
+      input[type="text"], input[type="number"], textarea, select {
+        padding: 7px 9px;
+        color: var(--text);
+        background: var(--panel2);
+      }
+
+      textarea { width: 100%; resize: vertical; line-height: 1.5; }
+      input[type="checkbox"] { accent-color: var(--primary); }
+
+      button {
+        padding: 7px 11px;
+        color: #fff;
+        background: #2456ad;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      button:hover { filter: brightness(1.18); }
+      button:disabled { opacity: 0.4; cursor: not-allowed; filter: none; }
+      button.ghost { background: transparent; border-color: var(--border); color: var(--muted); }
+      button.ghost:hover { color: var(--text); border-color: var(--primary); }
+      button.danger { background: #923247; }
+      button.tiny { padding: 3px 7px; font-size: 11px; }
+
+      .hint { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 6px 0; }
+      .status { color: var(--muted); }
+      .ok { color: var(--ok); }
+      .error { color: var(--danger); }
+
+      details.section > summary {
+        cursor: pointer;
+        padding: 4px 0;
+        color: var(--muted);
+        user-select: none;
+      }
+      details.section > summary:hover { color: var(--text); }
+      details.section[open] > summary { color: var(--text); margin-bottom: 8px; }
+
+      /* ---------------------------- 调参网格 ---------------------------- */
+      .tuning-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+        gap: 8px 14px;
+      }
+      .tuning-item { display: flex; align-items: center; gap: 8px; }
+      .tuning-item label { flex: 1 1 auto; color: var(--muted); font-size: 12px; }
+      .tuning-item input[type="number"] { width: 96px; flex: 0 0 auto; }
+
+      /* ----------------------------- 日志区 ------------------------------ */
+      .log-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        padding-bottom: 10px;
+        margin-bottom: 10px;
+        border-bottom: 1px solid var(--border2);
+      }
+
+      .chip {
+        padding: 4px 9px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        background: var(--panel2);
+        color: var(--dim);
+        cursor: pointer;
+        font-size: 11px;
+        user-select: none;
+      }
+      .chip.on { color: var(--text); border-color: var(--primary); background: #1a2540; }
+      .chip.lv-debug.on { border-color: #5a6b8c; }
+      .chip.lv-info.on  { border-color: var(--primary); }
+      .chip.lv-warn.on  { border-color: var(--warn); }
+      .chip.lv-error.on { border-color: var(--danger); }
+
+      #logList {
+        max-height: 68vh;
+        overflow: auto;
+        border: 1px solid var(--border2);
+        border-radius: 8px;
+        background: var(--panel3);
+      }
+
+      .group-head {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 5px 10px;
+        background: #10182c;
+        border-bottom: 1px solid var(--border2);
+        color: var(--muted);
+        font-size: 11px;
+        cursor: pointer;
+        user-select: none;
+      }
+      .group-head:hover { color: var(--text); }
+
+      .entry {
+        border-bottom: 1px solid #131c33;
+        padding: 0;
+      }
+      .entry:last-child { border-bottom: none; }
+      .entry.lv-warn  { background: rgba(255, 196, 107, 0.05); }
+      .entry.lv-error { background: rgba(255, 122, 144, 0.07); }
+      .entry.sel { background: rgba(110, 168, 254, 0.12); }
+
+      .entry-head {
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+        padding: 5px 10px;
+        cursor: pointer;
+      }
+      .entry-head:hover { background: rgba(255, 255, 255, 0.035); }
+
+      .entry-head input[type="checkbox"] {
+        flex: 0 0 auto;
+        margin: 0;
+        align-self: center;
+        cursor: pointer;
+      }
+
+      .caret { flex: 0 0 10px; color: var(--dim); font-size: 10px; }
+      .time { flex: 0 0 auto; color: var(--dim); font-size: 11px; }
+
+      .lvl {
+        flex: 0 0 44px;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+      }
+      .lvl.debug { color: var(--dim); }
+      .lvl.info  { color: var(--primary); }
+      .lvl.warn  { color: var(--warn); }
+      .lvl.error { color: var(--danger); }
+
+      .rid {
+        flex: 0 0 auto;
+        padding: 1px 6px;
+        border-radius: 4px;
+        background: #1c2540;
+        color: #8fa8d8;
+        font-size: 10px;
+        cursor: pointer;
+      }
+      .rid:hover { background: #2a3660; color: #fff; }
+
+      .evt { flex: 0 0 auto; color: #b9c9ee; font-size: 11px; }
+      .summary {
+        flex: 1 1 auto;
+        color: var(--muted);
+        font-size: 11px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .entry-body {
+        display: none;
+        padding: 0 10px 10px 32px;
+      }
+      .entry.open .entry-body { display: block; }
+      .entry.open .caret { transform: rotate(90deg); display: inline-block; }
+
+      .entry-body pre {
+        max-height: 480px;
+        overflow: auto;
+        margin: 6px 0 0;
+        padding: 9px;
+        background: #060b18;
+        border: 1px solid var(--border2);
+        border-radius: 6px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        color: #c9dcff;
+        font-size: 11.5px;
+        line-height: 1.5;
+      }
+
+      .empty { padding: 28px; text-align: center; color: var(--dim); }
+      .count { color: var(--dim); font-size: 11px; }
+
+      mark { background: #4a3a12; color: #ffd88a; border-radius: 2px; }
+
+      .toast {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        padding: 9px 14px;
+        background: #1d3a63;
+        border: 1px solid var(--primary);
+        border-radius: 8px;
+        opacity: 0;
+        transition: opacity 0.2s;
+        pointer-events: none;
+        z-index: 10;
+      }
+      .toast.show { opacity: 1; }
+    </style>
+  </head>
+
+  <body>
+    <h1>Claude Code Tool Bridge</h1>
+
+    <!-- ==================== 配置 ==================== -->
+    <section class="panel">
+      <details class="section">
+        <summary>⚙️ 配置（提示词 / 调参 / 模型映射）</summary>
+
+        <div class="row" style="margin-bottom: 10px">
+          <label style="color: var(--muted)">提示词预设</label>
+          <select id="promptId" style="min-width: 220px"></select>
+          <button class="ghost tiny" id="resetPrompt">恢复预设原文</button>
+          <span class="hint" id="promptHint" style="margin: 0"></span>
+        </div>
+
+        <p class="hint">
+          占位符：<code>{{tools}}</code> 工具定义 · <code>{{force_tool_instruction}}</code>
+          随 tool_choice 变化 · <code>{{protocol_rules}}</code> 协议硬约束（不写则自动追加到末尾）。
+          <strong>这里改的提示词只在当前进程生效，重启回到 adapt.js 里的预设。</strong>
+          试出好效果后请把文本抄回 adapt.js 的 PROMPT_PRESETS。
+        </p>
+
+        <textarea id="toolPrompt" style="min-height: 200px"></textarea>
+
+        <details class="section" style="margin-top: 12px">
+          <summary>🎛️ 调参（对应 adapt.js 的 DEFAULT_TUNING）</summary>
+          <div class="tuning-grid" id="tuningGrid"></div>
+        </details>
+
+        <details class="section" style="margin-top: 8px">
+          <summary>🔀 模型映射 / 其它</summary>
+
+          <p class="hint">
+            Claude Code 会提交 Claude 模型名，上游没有就在这里映射，例如
+            <code>{"claude-*":"qwen3-coder"}</code>
+          </p>
+
+          <textarea id="modelMap" style="min-height: 90px"></textarea>
+
+          <div class="row" style="margin-top: 10px">
+            <label class="row" style="gap: 6px">
+              <input id="includeOriginalSystem" type="checkbox" />
+              <span style="color: var(--muted)">转发 Claude Code 原始超长 System Prompt</span>
+            </label>
+
+            <label class="row" style="gap: 6px">
+              <input id="logBodies" type="checkbox" />
+              <span style="color: var(--muted)">日志记录完整请求/响应体</span>
+            </label>
+
+            <label class="row" style="gap: 6px">
+              <span style="color: var(--muted)">日志级别</span>
+              <select id="logLevel"></select>
+            </label>
+          </div>
+        </details>
+
+        <div class="row" style="margin-top: 12px">
+          <button id="saveConfig">保存配置</button>
+          <span id="configStatus" class="status"></span>
+        </div>
+      </details>
+    </section>
+
+    <!-- ==================== 日志 ==================== -->
+    <section class="panel">
+      <h2>实时日志</h2>
+
+      <div class="log-toolbar">
+        <input
+          type="text"
+          id="search"
+          class="grow"
+          placeholder="搜索内容 / 事件名 / requestId…"
+          style="min-width: 200px"
+        />
+
+        <span id="levelChips"></span>
+
+        <select id="eventFilter">
+          <option value="">全部事件</option>
+        </select>
+
+        <button class="ghost tiny" id="onlyProblems">只看问题</button>
+        <button class="ghost tiny" id="clearFilters">重置筛选</button>
+      </div>
+
+      <div class="log-toolbar">
+        <label class="row" style="gap: 5px">
+          <input type="checkbox" id="selectAll" />
+          <span style="color: var(--muted); font-size: 12px">全选可见</span>
+        </label>
+
+        <button id="copySelected" disabled>复制选中 (0)</button>
+        <button class="ghost" id="copyVisible">复制全部可见</button>
+
+        <button class="ghost tiny" id="expandAll">展开全部</button>
+        <button class="ghost tiny" id="collapseAll">折叠全部</button>
+
+        <label class="row" style="gap: 5px">
+          <input type="checkbox" id="groupByRequest" checked />
+          <span style="color: var(--muted); font-size: 12px">按请求分组</span>
+        </label>
+
+        <label class="row" style="gap: 5px">
+          <input type="checkbox" id="autoScroll" checked />
+          <span style="color: var(--muted); font-size: 12px">自动滚动</span>
+        </label>
+
+        <span class="grow"></span>
+        <span class="count" id="counts"></span>
+        <button class="ghost tiny" id="pause">⏸ 暂停</button>
+        <button class="danger tiny" id="clearLogs">清空</button>
+      </div>
+
+      <p class="hint" style="margin-top: 0">
+        排查「工具不调用」看 <code>extract.*</code>；排查「上下文不稳」看
+        <code>context.trim</code>；<code>requestId</code> 点一下可只看那一次完整往返。
+        日志含源码与私有上下文，请勿公开。
+      </p>
+
+      <div id="logList"><div class="empty">等待日志…</div></div>
+    </section>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+      /* ------------------------------ 状态 ------------------------------ */
+      const state = {
+        entries: [],
+        selected: new Set(),
+        expanded: new Set(),
+        collapsedGroups: new Set(),
+        levels: new Set(["debug", "info", "warn", "error"]),
+        event: "",
+        search: "",
+        requestId: "",
+        groupBy: true,
+        autoScroll: true,
+        paused: false,
+        pendingWhilePaused: [],
+        presets: [],
+        defaultTuning: {}
+      };
+
+      const $ = (id) => document.getElementById(id);
+      const logList = $("logList");
+
+      /* 调参项的中文说明。adapt.js 里加了新字段这里没写也能显示，只是用英文键名。 */
+      const TUNING_LABELS = {
+        keepRecentMessages: "最近 N 条消息不压缩",
+        toolResultMaxChars: "历史工具结果字符上限",
+        textMaxChars: "历史文本字符上限",
+        toolCallSummaryOverChars: "超过多长的工具调用压成摘要",
+        dropThinkingInHistory: "历史里丢弃思考块",
+        maxTotalChars: "总字符兜底上限（0=不限）",
+        emitIncompleteToolCalls: "缺参数时仍下发（推荐开）",
+        maxToolCallsPerTurn: "每轮最多几个工具调用",
+        appendStopSequence: "自动追加 </tool_call> stop",
+        repeatWarningThreshold: "连续重复几次才警告（0=关）",
+        toolDescriptionMaxChars: "工具描述截断长度"
+      };
+
+      /* --------------------------- 通用请求 ----------------------------- */
+      async function request(url, options = {}) {
+        const response = await fetch(url, {
+          credentials: "same-origin",
+          ...options,
+          headers: { "Content-Type": "application/json", ...(options.headers || {}) }
+        });
+
+        const text = await response.text();
+        let data = {};
+
+        try {
+          data = text ? JSON.parse(text) : {};
+        } catch {
+          data = { raw: text };
+        }
+
+        if (!response.ok) throw new Error(data.error?.message || data.error || text);
+        return data;
+      }
+
+      function toast(message) {
+        const el = $("toast");
+        el.textContent = message;
+        el.classList.add("show");
+        clearTimeout(el._timer);
+        el._timer = setTimeout(() => el.classList.remove("show"), 1600);
+      }
+
+      async function copyText(text, label) {
+        try {
+          await navigator.clipboard.writeText(text);
+          toast(label);
+        } catch {
+          // 非 HTTPS 环境下 clipboard API 不可用，退回 textarea 方案
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          try {
+            document.execCommand("copy");
+            toast(label);
+          } catch {
+            toast("复制失败，请手动选择");
+          }
+          ta.remove();
+        }
+      }
+
+      /* --------------------- 每种事件的一行摘要 -------------------------- */
+      function summarize(entry) {
+        const d = entry.data || {};
+
+        switch (entry.event) {
+          case "request.in":
+            return `${d.entry} · ${d.model || "?"}${
+              d.mappedModel && d.mappedModel !== d.model ? ` → ${d.mappedModel}` : ""
+            } · ${d.messageCount} 条消息 · ${d.toolCount} 个工具${d.stream ? " · 流式" : ""}`;
+
+          case "context.trim":
+            return `保留 ${d.keptIntact}/${d.total} 条完整 · 省 ${fmtNum(
+              d.savedChars
+            )} 字符 · 摘要化调用 ${d.summarizedToolCalls} · 截断结果 ${
+              d.truncatedToolResults
+            } · 丢弃思考块 ${d.droppedThinking}`;
+
+          case "upstream.request":
+            return `→ ${d.model} · ${d.messageCount} 条消息 · ${fmtNum(d.payloadChars)} 字符`;
+
+          case "upstream.response":
+            return `${d.status} ${d.statusText || ""} · ${d.durationMs}ms · ${fmtNum(
+              d.rawChars
+            )} 字符${d.attempt > 1 ? ` · 第 ${d.attempt} 次尝试` : ""}`;
+
+          case "upstream.retry":
+            return `状态 ${d.status}，${d.delayMs}ms 后重试（第 ${d.attempt} 次）`;
+
+          case "extract.candidates":
+            return `找到 ${d.count} 个候选：${(d.kinds || []).join(", ")}`;
+
+          case "extract.ok":
+            return `✓ ${(d.tools || []).join(", ")}${
+              d.droppedTrailingChars ? ` · 丢弃调用后 ${fmtNum(d.droppedTrailingChars)} 字符` : ""
+            }`;
+
+          case "extract.missing_required":
+            return `⚠ ${d.tool} 缺参数 [${(d.missing || []).join(", ")}]，已下发让模型自我修正`;
+
+          case "extract.rejected":
+            return `✗ ${d.reason}${d.tool ? ` · ${d.tool}` : ""}${
+              d.declaredName ? ` · 模型写的名字：${d.declaredName}` : ""
+            }${d.missing ? ` · 缺 [${d.missing.join(", ")}]` : ""}`;
+
+          case "extract.all_rejected":
+            return `✗✗ ${d.candidates} 个候选全部解析失败 —— 这就是"工具不调用"的现场`;
+
+          case "extract.no_candidate":
+            return `模型没有输出任何工具调用（${fmtNum(d.textLength)} 字符纯文本）`;
+
+          case "response.out":
+            return `${d.stopReason || d.finishReason} · ${
+              (d.toolCalls || [])
+                .map((c) => (typeof c === "string" ? c : `${c.name}(${(c.args || []).join(",")})`))
+                .join(", ") || "无工具调用"
+            } · 正文 ${d.textLength} 字`;
+
+          case "loop.repeat_detected":
+            return "检测到连续重复调用，已注入纠偏提示";
+
+          case "request.failed":
+            return `${d.status} · ${d.message || ""}`;
+
+          default:
+            return shorten(JSON.stringify(d), 160);
+        }
+      }
+
+      const fmtNum = (n) =>
+        typeof n === "number" ? (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)) : "?";
+
+      const shorten = (s, n) => (s && s.length > n ? `${s.slice(0, n)}…` : s || "");
+
+      /* ------------------------- 筛选与渲染 ----------------------------- */
+      function matches(entry) {
+        if (!state.levels.has(entry.level)) return false;
+        if (state.event && entry.event !== state.event) return false;
+        if (state.requestId && entry.requestId !== state.requestId) return false;
+
+        if (state.search) {
+          const haystack = `${entry.event} ${entry.requestId} ${entry.level} ${JSON.stringify(
+            entry.data
+          )}`.toLowerCase();
+
+          if (!haystack.includes(state.search.toLowerCase())) return false;
+        }
+
+        return true;
+      }
+
+      function visibleEntries() {
+        return state.entries.filter(matches);
+      }
+
+      function entryToText(entry) {
+        return (
+          `[${entry.time}] [${entry.level}] [${entry.requestId}] ${entry.event}\n` +
+          JSON.stringify(entry.data, null, 2)
+        );
+      }
+
+      function buildEntryNode(entry) {
+        const node = document.createElement("div");
+        node.className = `entry lv-${entry.level}`;
+        node.dataset.id = entry.id;
+
+        if (state.expanded.has(entry.id)) node.classList.add("open");
+        if (state.selected.has(entry.id)) node.classList.add("sel");
+
+        const head = document.createElement("div");
+        head.className = "entry-head";
+
+        const check = document.createElement("input");
+        check.type = "checkbox";
+        check.checked = state.selected.has(entry.id);
+        check.addEventListener("click", (event) => {
+          event.stopPropagation();
+          toggleSelect(entry.id, check.checked);
+          node.classList.toggle("sel", check.checked);
+        });
+
+        const caret = document.createElement("span");
+        caret.className = "caret";
+        caret.textContent = "▶";
+
+        const time = document.createElement("span");
+        time.className = "time";
+        time.textContent = new Date(entry.time).toLocaleTimeString("zh-CN", {
+          hour12: false
+        });
+
+        const level = document.createElement("span");
+        level.className = `lvl ${entry.level}`;
+        level.textContent = entry.level;
+
+        const rid = document.createElement("span");
+        rid.className = "rid";
+        rid.textContent = entry.requestId;
+        rid.title = "只看这一次请求";
+        rid.addEventListener("click", (event) => {
+          event.stopPropagation();
+          state.requestId = state.requestId === entry.requestId ? "" : entry.requestId;
+          render();
+        });
+
+        const evt = document.createElement("span");
+        evt.className = "evt";
+        evt.textContent = entry.event;
+
+        const summary = document.createElement("span");
+        summary.className = "summary";
+        summary.textContent = summarize(entry);
+
+        const copyBtn = document.createElement("button");
+        copyBtn.className = "ghost tiny";
+        copyBtn.textContent = "复制";
+        copyBtn.addEventListener("click", (event) => {
+          event.stopPropagation();
+          copyText(entryToText(entry), "已复制这一条");
+        });
+
+        head.append(check, caret, time, level, rid, evt, summary, copyBtn);
+
+        head.addEventListener("click", () => {
+          const open = node.classList.toggle("open");
+          if (open) state.expanded.add(entry.id);
+          else state.expanded.delete(entry.id);
+
+          if (open && !node._filled) {
+            node._filled = true;
+            body.appendChild(buildBody(entry));
+          }
+        });
+
+        const body = document.createElement("div");
+        body.className = "entry-body";
+
+        if (state.expanded.has(entry.id)) {
+          node._filled = true;
+          body.appendChild(buildBody(entry));
+        }
+
+        node.append(head, body);
+        return node;
+      }
+
+      function buildBody(entry) {
+        const wrap = document.createElement("div");
+
+        const bar = document.createElement("div");
+        bar.className = "row";
+        bar.style.marginTop = "4px";
+
+        const copyJson = document.createElement("button");
+        copyJson.className = "ghost tiny";
+        copyJson.textContent = "复制 JSON";
+        copyJson.addEventListener("click", (event) => {
+          event.stopPropagation();
+          copyText(JSON.stringify(entry.data, null, 2), "已复制 JSON");
+        });
+
+        bar.appendChild(copyJson);
+
+        // 上游原始回复单独给一个按钮：排查解析问题时最常复制的就是它
+        const raw = entry.data?.raw;
+
+        if (typeof raw === "string" && raw) {
+          const copyRaw = document.createElement("button");
+          copyRaw.className = "ghost tiny";
+          copyRaw.textContent = "只复制 raw 正文";
+          copyRaw.addEventListener("click", (event) => {
+            event.stopPropagation();
+            copyText(raw, "已复制上游原始正文");
+          });
+          bar.appendChild(copyRaw);
+        }
+
+        const pre = document.createElement("pre");
+        pre.textContent = JSON.stringify(entry.data, null, 2);
+
+        wrap.append(bar, pre);
+        return wrap;
+      }
+
+      function render() {
+        const list = visibleEntries();
+        logList.innerHTML = "";
+
+        if (!list.length) {
+          logList.innerHTML = '<div class="empty">没有匹配的日志</div>';
+          updateCounts(0);
+          return;
+        }
+
+        if (state.groupBy) {
+          let currentId = null;
+          let container = null;
+
+          for (const entry of list) {
+            if (entry.requestId !== currentId) {
+              currentId = entry.requestId;
+
+              const head = document.createElement("div");
+              head.className = "group-head";
+
+              const groupEntries = list.filter((item) => item.requestId === currentId);
+              const worst = groupEntries.some((item) => item.level === "error")
+                ? "❌"
+                : groupEntries.some((item) => item.level === "warn")
+                  ? "⚠️"
+                  : "✅";
+
+              const id = currentId;
+              head.textContent = `${worst} 请求 ${id} · ${groupEntries.length} 条`;
+
+              const copyGroup = document.createElement("button");
+              copyGroup.className = "ghost tiny";
+              copyGroup.style.marginLeft = "auto";
+              copyGroup.textContent = "复制整个请求";
+              copyGroup.addEventListener("click", (event) => {
+                event.stopPropagation();
+                copyText(
+                  groupEntries.map(entryToText).join("\n\n" + "-".repeat(60) + "\n\n"),
+                  `已复制请求 ${id} 的 ${groupEntries.length} 条日志`
+                );
+              });
+
+              head.appendChild(copyGroup);
+
+              head.addEventListener("click", () => {
+                if (state.collapsedGroups.has(id)) state.collapsedGroups.delete(id);
+                else state.collapsedGroups.add(id);
+                render();
+              });
+
+              logList.appendChild(head);
+
+              container = document.createElement("div");
+              if (state.collapsedGroups.has(currentId)) container.style.display = "none";
+              logList.appendChild(container);
+            }
+
+            container.appendChild(buildEntryNode(entry));
+          }
+        } else {
+          for (const entry of list) logList.appendChild(buildEntryNode(entry));
+        }
+
+        updateCounts(list.length);
+        if (state.autoScroll) logList.scrollTop = logList.scrollHeight;
+      }
+
+      function updateCounts(visible) {
+        const problems = state.entries.filter(
+          (entry) => entry.level === "warn" || entry.level === "error"
+        ).length;
+
+        $("counts").textContent =
+          `显示 ${visible} / 共 ${state.entries.length} 条` +
+          (problems ? ` · ⚠️ ${problems} 条问题` : "") +
+          (state.requestId ? ` · 已锁定 ${state.requestId}` : "") +
+          (state.paused ? " · 已暂停" : "");
+
+        $("copySelected").textContent = `复制选中 (${state.selected.size})`;
+        $("copySelected").disabled = state.selected.size === 0;
+      }
+
+      function toggleSelect(id, on) {
+        if (on) state.selected.add(id);
+        else state.selected.delete(id);
+        updateCounts(visibleEntries().length);
+      }
+
+      function addEntry(entry) {
+        state.entries.push(entry);
+        while (state.entries.length > 2000) {
+          const dropped = state.entries.shift();
+          state.selected.delete(dropped.id);
+          state.expanded.delete(dropped.id);
+        }
+
+        if (!$("eventFilter").querySelector(`option[value="${entry.event}"]`)) {
+          const option = document.createElement("option");
+          option.value = entry.event;
+          option.textContent = entry.event;
+          $("eventFilter").appendChild(option);
+        }
+      }
+
+      /* ----------------------------- SSE ------------------------------- */
+      let eventSource = null;
+
+      function startLogs() {
+        if (eventSource) eventSource.close();
+
+        state.entries = [];
+        state.selected.clear();
+        state.expanded.clear();
+
+        eventSource = new EventSource("/api/logs");
+
+        eventSource.addEventListener("log", (event) => {
+          let entry;
+
+          try {
+            entry = JSON.parse(event.data);
+          } catch {
+            entry = {
+              id: Math.random().toString(36).slice(2),
+              time: new Date().toISOString(),
+              level: "error",
+              event: "client.parse_error",
+              requestId: "-",
+              data: { raw: event.data }
+            };
+          }
+
+          if (state.paused) {
+            state.pendingWhilePaused.push(entry);
+            return;
+          }
+
+          addEntry(entry);
+          render();
+        });
+
+        eventSource.onerror = () => console.warn("日志 SSE 断开，浏览器会自动重连。");
+      }
+
+      /* --------------------------- 配置面板 ----------------------------- */
+      async function loadEverything() {
+        const [presetInfo, config] = await Promise.all([
+          request("/api/presets"),
+          request("/api/config")
+        ]);
+
+        state.presets = presetInfo.presets;
+        state.defaultTuning = presetInfo.defaultTuning;
+
+        const promptSelect = $("promptId");
+        promptSelect.innerHTML = "";
+
+        for (const preset of presetInfo.presets) {
+          const option = document.createElement("option");
+          option.value = preset.id;
+          option.textContent = preset.label;
+          promptSelect.appendChild(option);
+        }
+
+        promptSelect.value = config.promptId;
+        $("toolPrompt").value = config.effectiveToolPrompt || "";
+        updatePromptHint();
+
+        const levelSelect = $("logLevel");
+        levelSelect.innerHTML = "";
+
+        for (const level of presetInfo.logLevels) {
+          const option = document.createElement("option");
+          option.value = level;
+          option.textContent = level;
+          levelSelect.appendChild(option);
+        }
+
+        levelSelect.value = config.logLevel;
+        $("includeOriginalSystem").checked = config.includeOriginalSystem === true;
+        $("logBodies").checked = config.logBodies !== false;
+        $("modelMap").value = JSON.stringify(config.modelMap || {}, null, 2);
+
+        buildTuningControls(presetInfo.defaultTuning, config.tuning || {});
+      }
+
+      function buildTuningControls(defaults, current) {
+        const grid = $("tuningGrid");
+        grid.innerHTML = "";
+
+        for (const [key, fallback] of Object.entries(defaults)) {
+          const item = document.createElement("div");
+          item.className = "tuning-item";
+
+          const label = document.createElement("label");
+          label.textContent = TUNING_LABELS[key] || key;
+          label.title = key;
+          label.htmlFor = `tune_${key}`;
+
+          const input = document.createElement("input");
+          input.id = `tune_${key}`;
+          input.dataset.tuningKey = key;
+
+          if (typeof fallback === "boolean") {
+            input.type = "checkbox";
+            input.checked = current[key] ?? fallback;
+          } else {
+            input.type = "number";
+            input.min = "0";
+            input.value = current[key] ?? fallback;
+          }
+
+          item.append(label, input);
+          grid.appendChild(item);
+        }
+      }
+
+      function collectTuning() {
+        const tuning = {};
+
+        for (const input of document.querySelectorAll("[data-tuning-key]")) {
+          tuning[input.dataset.tuningKey] =
+            input.type === "checkbox" ? input.checked : Number(input.value);
+        }
+
+        return tuning;
+      }
+
+      function updatePromptHint() {
+        const preset = state.presets.find((item) => item.id === $("promptId").value);
+        $("promptHint").textContent = preset?.hint || "";
+      }
+
+      /* --------------------------- 事件绑定 ----------------------------- */
+      for (const level of ["debug", "info", "warn", "error"]) {
+        const chip = document.createElement("span");
+        chip.className = `chip lv-${level} on`;
+        chip.textContent = level;
+        chip.addEventListener("click", () => {
+          if (state.levels.has(level)) state.levels.delete(level);
+          else state.levels.add(level);
+          chip.classList.toggle("on", state.levels.has(level));
+          render();
+        });
+        $("levelChips").appendChild(chip);
+      }
+
+      let searchTimer;
+      $("search").addEventListener("input", (event) => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => {
+          state.search = event.target.value.trim();
+          render();
+        }, 180);
+      });
+
+      $("eventFilter").addEventListener("change", (event) => {
+        state.event = event.target.value;
+        render();
+      });
+
+      $("onlyProblems").addEventListener("click", () => {
+        state.levels = new Set(["warn", "error"]);
+        for (const chip of $("levelChips").children) {
+          chip.classList.toggle("on", state.levels.has(chip.textContent));
+        }
+        render();
+      });
+
+      $("clearFilters").addEventListener("click", () => {
+        state.levels = new Set(["debug", "info", "warn", "error"]);
+        state.event = "";
+        state.search = "";
+        state.requestId = "";
+        $("search").value = "";
+        $("eventFilter").value = "";
+        for (const chip of $("levelChips").children) chip.classList.add("on");
+        render();
+      });
+
+      $("selectAll").addEventListener("change", (event) => {
+        const list = visibleEntries();
+        if (event.target.checked) for (const entry of list) state.selected.add(entry.id);
+        else for (const entry of list) state.selected.delete(entry.id);
+        render();
+      });
+
+      $("copySelected").addEventListener("click", () => {
+        const chosen = state.entries.filter((entry) => state.selected.has(entry.id));
+        copyText(
+          chosen.map(entryToText).join("\n\n" + "-".repeat(60) + "\n\n"),
+          `已复制 ${chosen.length} 条`
+        );
+      });
+
+      $("copyVisible").addEventListener("click", () => {
+        const list = visibleEntries();
+        copyText(
+          list.map(entryToText).join("\n\n" + "-".repeat(60) + "\n\n"),
+          `已复制 ${list.length} 条`
+        );
+      });
+
+      $("expandAll").addEventListener("click", () => {
+        for (const entry of visibleEntries()) state.expanded.add(entry.id);
+        render();
+      });
+
+      $("collapseAll").addEventListener("click", () => {
+        state.expanded.clear();
+        render();
+      });
+
+      $("groupByRequest").addEventListener("change", (event) => {
+        state.groupBy = event.target.checked;
+        render();
+      });
+
+      $("autoScroll").addEventListener("change", (event) => {
+        state.autoScroll = event.target.checked;
+      });
+
+      $("pause").addEventListener("click", () => {
+        state.paused = !state.paused;
+        $("pause").textContent = state.paused ? "▶ 继续" : "⏸ 暂停";
+
+        if (!state.paused && state.pendingWhilePaused.length) {
+          for (const entry of state.pendingWhilePaused) addEntry(entry);
+          state.pendingWhilePaused = [];
+        }
+
+        render();
+      });
+
+      $("clearLogs").addEventListener("click", async () => {
+        if (!confirm("只清空当前进程内存中的日志，是否继续？")) return;
+
+        try {
+          await request("/api/logs", { method: "DELETE" });
+          state.entries = [];
+          state.selected.clear();
+          state.expanded.clear();
+          state.collapsedGroups.clear();
+          render();
+        } catch (error) {
+          alert("清空失败：" + error.message);
+        }
+      });
+
+      $("promptId").addEventListener("change", async () => {
+        const preset = state.presets.find((item) => item.id === $("promptId").value);
+        if (preset) $("toolPrompt").value = preset.text;
+        updatePromptHint();
+      });
+
+      $("resetPrompt").addEventListener("click", () => {
+        const preset = state.presets.find((item) => item.id === $("promptId").value);
+        if (preset) $("toolPrompt").value = preset.text;
+        toast("已恢复为 adapt.js 里的预设原文");
+      });
+
+      $("saveConfig").addEventListener("click", async () => {
+        const status = $("configStatus");
+        status.className = "status";
+        status.textContent = "保存中…";
+
+        try {
+          const modelMapText = $("modelMap").value.trim();
+          const preset = state.presets.find((item) => item.id === $("promptId").value);
+          const edited = $("toolPrompt").value;
+
+          await request("/api/config", {
+            method: "PUT",
+            body: JSON.stringify({
+              promptId: $("promptId").value,
+              // 和预设原文一致就不当作覆盖，保持"以代码为准"
+              toolPrompt: edited === preset?.text ? "" : edited,
+              includeOriginalSystem: $("includeOriginalSystem").checked,
+              logBodies: $("logBodies").checked,
+              logLevel: $("logLevel").value,
+              modelMap: modelMapText ? JSON.parse(modelMapText) : {},
+              tuning: collectTuning()
+            })
+          });
+
+          status.className = "ok";
+          status.textContent = "已保存，新请求立即生效。";
+        } catch (error) {
+          status.className = "error";
+          status.textContent = "保存失败：" + error.message;
+        }
+      });
+
+      loadEverything().catch((error) => {
+        $("configStatus").className = "error";
+        $("configStatus").textContent = "加载配置失败：" + error.message;
+      });
+
+      startLogs();
+    </script>
+  </body>
+</html>

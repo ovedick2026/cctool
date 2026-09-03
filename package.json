@@ -1,0 +1,19 @@
+{
+  "name": "claude-code-tool-bridge",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "加工具能力",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test adapt.test.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "undici": "^6.21.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -33,6 +33,9 @@ dns.setDefaultResultOrder("ipv4first");
 const PORT = Number(process.env.PORT || 7860);
 const CONFIG_FILE = process.env.CONFIG_FILE || "/tmp/tool-bridge-config.json";
 
+// 新增：Web 控制台开关，默认关闭 (设置为 "true" 时才开启)
+const ENABLE_DASHBOARD = process.env.ENABLE_DASHBOARD === "true";
+
 const MAX_LOG_ENTRIES = 200;
 const MAX_LOG_RAW_CHARS = 20000;
 
@@ -180,62 +183,67 @@ app.use((error, req, res, next) => {
 /*                               Dashboard APIs                               */
 /* -------------------------------------------------------------------------- */
 
-app.get("/api/config", (req, res) => {
-  res.json({
-    ...runtimeConfig,
-    effectiveToolPrompt: currentPromptText()
-  });
-});
-
-app.put("/api/config", (req, res) => {
-  try {
-    runtimeConfig = sanitizeConfig(req.body);
-    saveConfig(runtimeConfig);
-    res.json({ ok: true, config: runtimeConfig });
-  } catch (error) {
-    res.status(400).json({ error: error?.message || "Invalid configuration." });
-  }
-});
-
-app.get("/api/presets", (req, res) => {
-  res.json({
-    presets: adapt.PROMPT_PRESETS.map(({ id, label, hint, text }) => ({
-      id,
-      label,
-      hint,
-      text
-    })),
-    protocolRules: adapt.PROTOCOL_RULES,
-    defaultTuning: adapt.DEFAULT_TUNING,
-    logLevels: Object.keys(LOG_LEVELS)
-  });
-});
-
-app.get("/api/logs", (req, res) => {
-  setupSSE(res);
-
-  for (const entry of logBus.entries) {
-    res.write(`event: log\ndata: ${JSON.stringify(entry)}\n\n`);
-  }
-
-  logBus.clients.add(res);
-  req.on("close", () => logBus.clients.delete(res));
-});
-
-app.delete("/api/logs", (req, res) => {
-  logBus.entries = [];
-  res.json({ ok: true });
-});
-
+// 无论开关与否，健康检查接口保持开放（方便 Docker / 宝塔 等健康检查）
 app.get("/healthz", (req, res) => {
   res.json({
     ok: true,
     service: "claude-code-tool-bridge",
+    dashboardEnabled: ENABLE_DASHBOARD,
     allowedHostsConfigured: ALLOWED_HOSTS.length > 0
   });
 });
 
-app.use(express.static(path.join(path.dirname(fileURLToPath(import.meta.url)), "public")));
+if (ENABLE_DASHBOARD) {
+  // 只有当 ENABLE_DASHBOARD === "true" 时，才注册 Web 界面和 API 路由
+  console.log("[tool-bridge] 💡 Web 控制台已开启");
+
+  app.get("/api/config", (req, res) => {
+    res.json({
+      ...runtimeConfig,
+      effectiveToolPrompt: currentPromptText()
+    });
+  });
+
+  app.put("/api/config", (req, res) => {
+    try {
+      runtimeConfig = sanitizeConfig(req.body);
+      saveConfig(runtimeConfig);
+      res.json({ ok: true, config: runtimeConfig });
+    } catch (error) {
+      res.status(400).json({ error: error?.message || "Invalid configuration." });
+    }
+  });
+
+  app.get("/api/presets", (req, res) => {
+    res.json({
+      presets: adapt.PROMPT_PRESETS.map(({ id, label, hint, text }) => ({
+        id, label, hint, text
+      })),
+      protocolRules: adapt.PROTOCOL_RULES,
+      defaultTuning: adapt.DEFAULT_TUNING,
+      logLevels: Object.keys(LOG_LEVELS)
+    });
+  });
+
+  app.get("/api/logs", (req, res) => {
+    setupSSE(res);
+    for (const entry of logBus.entries) {
+      res.write(`event: log\ndata: ${JSON.stringify(entry)}\n\n`);
+    }
+    logBus.clients.add(res);
+    req.on("close", () => logBus.clients.delete(res));
+  });
+
+  app.delete("/api/logs", (req, res) => {
+    logBus.entries = [];
+    res.json({ ok: true });
+  });
+
+  // 静态网页文件托管
+  app.use(express.static(path.join(path.dirname(fileURLToPath(import.meta.url)), "public")));
+} else {
+  console.log("[tool-bridge] 🔒 Web 控制台已完全关闭 (未设置 ENABLE_DASHBOARD=true)");
+}
 
 /* -------------------------------------------------------------------------- */
 /*                              Main Proxy Router                             */

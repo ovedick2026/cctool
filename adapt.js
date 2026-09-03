@@ -82,9 +82,9 @@ export const PROTOCOL_RULES = `额外协议要求：
 
 export const PROMPT_PRESETS = [
   {
-    id: "todo-auto-single",
-    label: "单步自动 TODO 驱动模式",
-    hint: "兼顾简单问答与复杂工程：简单任务直接搞定，复杂任务单步自动循环推进。",
+    id: "todo-single-step",
+    label: "单步 TODO 驱动模式",
+    hint: "简单任务直接回答/执行；复杂工程严格遵循“单步执行-单步存档”交替切分，坚决不跨轮次生成。",
     text: `你是可调用工具的通用编程与任务助手。
 
 ### 【最高法则：用户指令绝对优先】
@@ -123,9 +123,9 @@ export const PROMPT_PRESETS = [
 
 ---
 
-### 【循环机制】
+### 【轮次交互规则】
 1. **单步限制**：无论策略 A 或 B，每次 API 回答**最多包含 1 个工具调用**，思考范围仅限于本次任务。
-2. **连续推进**：收到 [TOOL RESULT] 后（表示上一步已完成），若整个任务尚未完全结束，你**必须在本次回答中直接发出下一个任务的 <tool_call>**。绝对禁止输出纯文本废话（如“收到”、“已完成，请发送下一条命令”），否则流程将中断！
+2. **停止与等待**：收到 [TOOL RESULT] 后（表示上一步已完成），若整个任务尚未完全结束，你**必须在本次回答中直接发出下一个任务的 <tool_call>**。绝对禁止输出纯文本废话（如“收到”、“已完成，请发送下一条命令”），否则流程将中断！
 3. **完成退出**：只有当所有操作已完成，且无需任何后续工具调用时，才输出纯文本总结并停止发工具。
 
 ---
@@ -136,7 +136,7 @@ export const PROMPT_PRESETS = [
   }
 ];
 
-export const DEFAULT_PROMPT_ID = "minimal";
+export const DEFAULT_PROMPT_ID = "todo-single-step";
 
 export function getPreset(id) {
   return (

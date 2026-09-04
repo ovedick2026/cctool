@@ -1,5 +1,5 @@
 /* ==========================================================================
- *  server.js —— 【通讯骨架层 (支持思考实时流 + 正文工具完整后提取)】
+ *  server.js —— 【通讯骨架层】
  * ========================================================================== */
 
 import express from "express";
@@ -13,12 +13,12 @@ import { fileURLToPath } from "node:url";
 // 1. 引入 undici 的 Agent 配置
 import { Agent, setGlobalDispatcher } from "undici";
 
-// 2. 调大 Node.js 底层的全局 fetch 超时时间（例如设为 20 分钟）
+// 2. 调大 Node.js 底层的全局 fetch 超时时间（例如设为 40 分钟 / 2400000ms）
 setGlobalDispatcher(
   new Agent({
-    headersTimeout: 1200000,
-    bodyTimeout: 1200000,
-    connectTimeout: 60000
+    headersTimeout: 2400000, // 响应头超时（设为 40 分钟）
+    bodyTimeout: 2400000,    // Body 传输超时
+    connectTimeout: 120000    // 建连超时
   })
 );
 
@@ -32,6 +32,8 @@ dns.setDefaultResultOrder("ipv4first");
 
 const PORT = Number(process.env.PORT || 7860);
 const CONFIG_FILE = process.env.CONFIG_FILE || "/tmp/tool-bridge-config.json";
+
+// 新增：Web 控制台开关，默认关闭 (设置为 "true" 时才开启)
 const ENABLE_DASHBOARD = process.env.ENABLE_DASHBOARD === "true";
 
 const MAX_LOG_ENTRIES = 200;
@@ -254,7 +256,8 @@ app.use(async (req, res) => {
       return res.status(404).json({
         error: {
           type: "invalid_request_error",
-          message: "Expected target URL path, e.g. /https://target.example.com/v1/messages"
+          message:
+            "Expected target URL path, e.g. /https://target.example.com/v1/messages"
         }
       });
     }
@@ -323,13 +326,12 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
   const tuning = runtimeConfig.tuning;
   const tools = normalizeAnthropicTools(body.tools || []);
   const hostOrigin = originalTargetUrl.origin;
-  const isClientStream = body.stream === true;
 
   log("info", "request.in", {
     entry: "anthropic",
     model: body.model,
     mappedModel: resolveModel(body.model),
-    clientStream: isClientStream,
+    stream: body.stream === true,
     messageCount: (body.messages || []).length,
     toolCount: tools.length,
     toolNames: tools.map((tool) => tool.name),
@@ -352,80 +354,25 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     renderedMessages.push({ role: "user", content: repeatWarning });
   }
 
-  // 状态跟踪对象：用来支持边推思考流，边缓冲正文
-  const streamState = {
-    started: false,
-    thinkingBlockStarted: false,
-    thinkingBlockClosed: false,
-    nextBlockIndex: 0,
-    fullThinkingText: "",
-    bufferedContentText: "",
-    nativeToolCalls: []
-  };
+  // 构建下游流式桥接器（仅当客户端要求流式时初始化）
+  const isClientStream = body.stream === true;
+  const streamBridge = isClientStream
+    ? new AnthropicStreamBridge(res, body.model, requestId, log)
+    : null;
 
-  // 思考块启动回调
-  const onThinkingStart = () => {
-    if (!isClientStream || streamState.thinkingBlockStarted) return;
-    if (!streamState.started) {
-      setupSSE(res);
-      sseSend(res, "message_start", {
-        type: "message_start",
-        message: {
-          id: `msg_${uuid()}`,
-          type: "message",
-          role: "assistant",
-          model: body.model || "claude-sonnet-x",
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: estimateTokens(body), output_tokens: 1 }
-        }
-      });
-      streamState.started = true;
-    }
-    sseSend(res, "content_block_start", {
-      type: "content_block_start",
-      index: streamState.nextBlockIndex,
-      content_block: { type: "thinking", thinking: "" }
-    });
-    streamState.thinkingBlockStarted = true;
-  };
-
-  // 思考内容增量回调
+  // 思考流回调：只要上游吐出思考增量，立即流式下发下游
   const onThinkingDelta = (chunk) => {
-    if (!chunk) return;
-    streamState.fullThinkingText += chunk;
-    if (!isClientStream) return;
-    onThinkingStart();
-    sseSend(res, "content_block_delta", {
-      type: "content_block_delta",
-      index: streamState.nextBlockIndex,
-      delta: { type: "thinking_delta", thinking: chunk }
-    });
+    if (streamBridge) streamBridge.emitThinkingDelta(chunk, estimateTokens(body));
   };
 
-  // 思考块结束回调
-  const closeThinkingBlockIfNeeded = () => {
-    if (!streamState.thinkingBlockStarted || streamState.thinkingBlockClosed) return;
-    if (isClientStream) {
-      sseSend(res, "content_block_delta", {
-        type: "content_block_delta",
-        index: streamState.nextBlockIndex,
-        delta: { type: "signature_delta", signature: DUMMY_THINKING_SIGNATURE }
-      });
-      sseSend(res, "content_block_stop", {
-        type: "content_block_stop",
-        index: streamState.nextBlockIndex
-      });
-    }
-    streamState.thinkingBlockClosed = true;
-    streamState.nextBlockIndex++;
-  };
-
+  let rawText = "";
+  let reasoningText = "";
+  let nativeToolCalls = [];
   let success = false;
+
   const cachedProtocol = endpointProtocolCache.get(hostOrigin);
 
-  // 1. 尝试 Anthropic 协议
+  // 1. 【改动处 1】：若支持 Anthropic，使用流式向 /v1/messages 发起请求
   if (cachedProtocol !== "openai") {
     try {
       log("info", "upstream.attempt", { mode: "anthropic_messages_stream", url: String(originalTargetUrl) });
@@ -443,34 +390,23 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
         max_tokens: body.max_tokens || 4096,
         temperature: body.temperature,
         top_p: body.top_p,
-        stream: true // 向上游开启流式
+        stream: true // 开启流式
       });
 
       const probeTimeout = cachedProtocol === "anthropic" ? UPSTREAM_TIMEOUT_MS : 60000;
-      await callUpstreamSSE(
-        req,
-        requestId,
-        originalTargetUrl,
-        anthropicBody,
-        (event, data) => {
-          if (data?.type === "content_block_start" && data?.content_block?.type === "thinking") {
-            onThinkingStart();
-          } else if (data?.type === "content_block_delta") {
-            if (data.delta?.type === "thinking_delta") {
-              onThinkingDelta(data.delta.thinking || "");
-            } else if (data.delta?.type === "text_delta") {
-              closeThinkingBlockIfNeeded();
-              streamState.bufferedContentText += data.delta.text || "";
-            }
-          } else if (data?.type === "content_block_stop") {
-            if (streamState.thinkingBlockStarted && !streamState.thinkingBlockClosed) {
-              closeThinkingBlockIfNeeded();
-            }
-          }
+      const upstreamResponse = await fetchUpstreamStreamWithRetry(requestId, originalTargetUrl, {
+        method: "POST",
+        headers: {
+          ...buildUpstreamHeaders(req),
+          "Content-Type": "application/json",
+          Accept: "text/event-stream, application/json"
         },
-        probeTimeout
-      );
+        body: JSON.stringify(anthropicBody)
+      }, probeTimeout);
 
+      const result = await consumeAnthropicStream(upstreamResponse, onThinkingDelta);
+      rawText = result.rawText;
+      reasoningText = result.reasoningText;
       success = true;
       endpointProtocolCache.set(hostOrigin, "anthropic");
     } catch (messagesError) {
@@ -479,15 +415,15 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
       }
       log("warn", "upstream.messages_failed", {
         message: messagesError?.message || String(messagesError),
-        hint: "Anthropic /v1/messages 失败，自动切换上游为 OpenAI /v1/chat/completions 接口"
+        hint: "Anthropic /v1/messages 不可用，自动切换并记忆上游为 OpenAI /v1/chat/completions 接口"
       });
       endpointProtocolCache.set(hostOrigin, "openai");
     }
   }
 
-  // 2. Fallback / 直接使用 OpenAI 接口
+  // 2. 【改动处 2】：Fallback 到 OpenAI 接口，使用流式发起请求
   if (!success) {
-    log("info", "upstream.attempt", { mode: "openai_chat_stream_fallback" });
+    log("info", "upstream.attempt", { mode: "openai_chat_fallback_stream" });
 
     const messages = [];
     if (runtimeConfig.includeOriginalSystem && compressed.system) {
@@ -502,83 +438,45 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
       temperature: body.temperature,
       top_p: body.top_p,
       stop: orUndefined(adapt.buildStopSequences(body.stop_sequences || body.stop, tools, tuning)),
-      stream: true // 向上游开启流式
+      stream: true // 开启流式
     });
 
     const upstreamUrl = rewriteAnthropicMessagesToOpenAI(originalTargetUrl);
-
-    // 针对带<think>标签的流式状态解析器
-    let inThinkTag = false;
-
-    await callUpstreamSSE(req, requestId, upstreamUrl, openAIBody, (event, data) => {
-      const choice = data?.choices?.[0];
-      if (!choice) return;
-
-      const delta = choice.delta || {};
-      const reasoningChunk = delta.reasoning_content || delta.reasoning;
-
-      // A. 上游通过专门的 reasoning_content 字段返回思考
-      if (reasoningChunk) {
-        onThinkingDelta(reasoningChunk);
-      }
-
-      // B. 接收普通内容流
-      if (delta.content) {
-        let contentChunk = delta.content;
-
-        // 处理混在 content 里的  标签
-        if (!inThinkTag && contentChunk.includes("")) {
-          inThinkTag = true;
-          const [before, after] = contentChunk.split("");
-          if (before) streamState.bufferedContentText += before;
-          contentChunk = after || "";
-        }
-
-        if (inThinkTag) {
-          if (contentChunk.includes("</think>")) {
-            const [thinkPart, after] = contentChunk.split("</think>");
-            onThinkingDelta(thinkPart);
-            closeThinkingBlockIfNeeded();
-            inThinkTag = false;
-            if (after) streamState.bufferedContentText += after;
-          } else {
-            onThinkingDelta(contentChunk);
-          }
-        } else {
-          // 正式正文：思考块必须关闭，开始积攒正文
-          closeThinkingBlockIfNeeded();
-          streamState.bufferedContentText += contentChunk;
-        }
-      }
-
-      // C. 原生 tool_calls 增量聚合
-      if (Array.isArray(delta.tool_calls)) {
-        closeThinkingBlockIfNeeded();
-        accumulateOpenAIToolCalls(streamState.nativeToolCalls, delta.tool_calls);
-      }
+    const upstreamResponse = await fetchUpstreamStreamWithRetry(requestId, upstreamUrl, {
+      method: "POST",
+      headers: {
+        ...buildUpstreamHeaders(req),
+        "Content-Type": "application/json",
+        Accept: "text/event-stream, application/json"
+      },
+      body: JSON.stringify(openAIBody)
     });
+
+    const result = await consumeOpenAIStream(upstreamResponse, onThinkingDelta);
+    rawText = result.rawText;
+    reasoningText = result.reasoningText;
+    nativeToolCalls = result.nativeToolCalls || [];
   }
 
-  // 保证思考块已被正常关闭
-  closeThinkingBlockIfNeeded();
+  // 流彻底结束，关闭下游思考块（若开启过）
+  if (streamBridge) streamBridge.finishThinking();
 
-  // 上游流完全接收完毕，现在进行完整的正文与工具解析提取
-  let rawText = streamState.bufferedContentText;
-  let reasoningText = streamState.fullThinkingText;
-
+  // 兜底提取可能夹在正文中的<think>
   const { text: cleanText, thinking } = adapt.splitThinking(rawText);
   if (!reasoningText && thinking) reasoningText = thinking;
 
-  // 使用 adapt 统一提取可能嵌在文本中的工具调用
-  const extracted = adapt.extractToolCalls(cleanText, tools, tuning, log, () => `toolu_${uuid()}`);
+  // 正文缓冲提取工具调用
+  const extracted = adapt.extractToolCalls(cleanText, tools, tuning, log, () =>
+    `toolu_${uuid()}`
+  );
 
-  const toolCalls = mergeToolCalls(
-    [
-      extractNativeOpenAIToolCalls({ tool_calls: streamState.nativeToolCalls }, tools, tuning),
-      extracted.toolCalls
-    ],
+  const nativeExtracted = extractNativeOpenAIToolCalls(
+    { tool_calls: nativeToolCalls },
+    tools,
     tuning
   );
+
+  const toolCalls = mergeToolCalls([nativeExtracted, extracted.toolCalls], tuning);
 
   const text = ensureVisibleAssistantText(
     extracted.content,
@@ -586,17 +484,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     "上游模型返回了空内容，未生成可执行的工具调用。"
   );
 
-  const response = buildAnthropicResponse({
-    requestModel: body.model,
-    text,
-    reasoningText,
-    toolCalls,
-    inputTokens: estimateTokens(body),
-    outputTokens: estimateTokens(rawText + reasoningText)
-  });
-
   log("info", "response.out", {
-    stopReason: response.stop_reason,
     toolCalls: toolCalls.map((call) => ({
       name: call.name,
       args: Object.keys(call.arguments || {})
@@ -606,68 +494,26 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     rejectedCandidates: extracted.rejected.length
   });
 
-  // 如果下游要求 stream（Claude Code 默认模式）
-  if (isClientStream) {
-    if (!streamState.started) {
-      setupSSE(res);
-      sseSend(res, "message_start", {
-        type: "message_start",
-        message: {
-          id: response.id,
-          type: "message",
-          role: "assistant",
-          model: response.model,
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: response.usage.input_tokens, output_tokens: 1 }
-        }
-      });
-      streamState.started = true;
-    }
-
-    // 补发适配好的 Text Block
-    if (text) {
-      const textIndex = streamState.nextBlockIndex++;
-      sseSend(res, "content_block_start", {
-        type: "content_block_start",
-        index: textIndex,
-        content_block: { type: "text", text: "" }
-      });
-      sseSend(res, "content_block_delta", {
-        type: "content_block_delta",
-        index: textIndex,
-        delta: { type: "text_delta", text }
-      });
-      sseSend(res, "content_block_stop", { type: "content_block_stop", index: textIndex });
-    }
-
-    // 补发适配好的 Tool Call Blocks
-    for (const call of toolCalls) {
-      const toolIndex = streamState.nextBlockIndex++;
-      sseSend(res, "content_block_start", {
-        type: "content_block_start",
-        index: toolIndex,
-        content_block: { type: "tool_use", id: call.id, name: call.name, input: {} }
-      });
-      sseSend(res, "content_block_delta", {
-        type: "content_block_delta",
-        index: toolIndex,
-        delta: { type: "input_json_delta", partial_json: JSON.stringify(call.arguments) }
-      });
-      sseSend(res, "content_block_stop", { type: "content_block_stop", index: toolIndex });
-    }
-
-    sseSend(res, "message_delta", {
-      type: "message_delta",
-      delta: { stop_reason: response.stop_reason, stop_sequence: null },
-      usage: response.usage
+  // 如果下游是流式，将抽取规整后的正文与工具调用推完收尾
+  if (streamBridge) {
+    return streamBridge.finishWithPayload({
+      text,
+      toolCalls,
+      inputTokens: estimateTokens(body),
+      outputTokens: estimateTokens(rawText + reasoningText)
     });
-    sseSend(res, "message_stop", { type: "message_stop" });
-    return res.end();
   }
 
-  // 非流模式下游直接返回 JSON
+  // 非流式请求直接响应标准 JSON
+  const response = buildAnthropicResponse({
+    requestModel: body.model,
+    text,
+    reasoningText,
+    toolCalls,
+    inputTokens: estimateTokens(body),
+    outputTokens: estimateTokens(rawText + reasoningText)
+  });
+
   return res.json(response);
 }
 
@@ -714,10 +560,7 @@ async function handleOpenAIChat(req, res, requestId, targetUrl) {
     messages.push({ role: "user", content: repeatWarning });
   }
 
-  let bufferedContent = "";
-  let bufferedReasoning = "";
-  const nativeToolCalls = [];
-
+  // 【改动处 3】：这里同样由 stream: false 改为流式请求
   const upstreamBody = cleanUndefined({
     model: resolveModel(body.model),
     messages,
@@ -726,32 +569,45 @@ async function handleOpenAIChat(req, res, requestId, targetUrl) {
     stop: orUndefined(adapt.buildStopSequences(body.stop, tools, tuning)),
     seed: body.seed,
     response_format: body.response_format,
-    stream: true
+    stream: true // 开启流式
   });
 
-  await callUpstreamSSE(req, requestId, targetUrl, upstreamBody, (event, data) => {
-    const choice = data?.choices?.[0];
-    if (!choice) return;
-    const delta = choice.delta || {};
-    if (delta.reasoning_content || delta.reasoning) {
-      bufferedReasoning += delta.reasoning_content || delta.reasoning;
-    }
-    if (delta.content) {
-      bufferedContent += delta.content;
-    }
-    if (Array.isArray(delta.tool_calls)) {
-      accumulateOpenAIToolCalls(nativeToolCalls, delta.tool_calls);
-    }
+  const isClientStream = body.stream === true;
+  const streamBridge = isClientStream ? new OpenAIStreamBridge(res, body.model) : null;
+
+  const onThinkingDelta = (chunk) => {
+    if (streamBridge) streamBridge.emitReasoningDelta(chunk);
+  };
+
+  const upstreamResponse = await fetchUpstreamStreamWithRetry(requestId, targetUrl, {
+    method: "POST",
+    headers: {
+      ...buildUpstreamHeaders(req),
+      "Content-Type": "application/json",
+      Accept: "text/event-stream, application/json"
+    },
+    body: JSON.stringify(upstreamBody)
   });
 
-  const { text: cleanText, thinking } = adapt.splitThinking(bufferedContent);
-  const reasoningText = bufferedReasoning || thinking || "";
+  const { rawText, reasoningText, nativeToolCalls } = await consumeOpenAIStream(
+    upstreamResponse,
+    onThinkingDelta
+  );
 
-  const extracted = adapt.extractToolCalls(cleanText, tools, tuning, log, () => `toolu_${uuid()}`);
-  const toolCalls = mergeToolCalls(
-    [extractNativeOpenAIToolCalls({ tool_calls: nativeToolCalls }, tools, tuning), extracted.toolCalls],
+  const { text: cleanText, thinking } = adapt.splitThinking(rawText);
+  const finalReasoning = reasoningText || thinking || "";
+
+  const extracted = adapt.extractToolCalls(cleanText, tools, tuning, log, () =>
+    `toolu_${uuid()}`
+  );
+
+  const nativeExtracted = extractNativeOpenAIToolCalls(
+    { tool_calls: nativeToolCalls },
+    tools,
     tuning
   );
+
+  const toolCalls = mergeToolCalls([nativeExtracted, extracted.toolCalls], tuning);
 
   const text = ensureVisibleAssistantText(
     extracted.content,
@@ -759,22 +615,366 @@ async function handleOpenAIChat(req, res, requestId, targetUrl) {
     "上游模型返回了空内容，未生成可执行的工具调用。"
   );
 
-  const response = buildOpenAIResponse({
-    model: body.model,
-    text,
-    reasoningText,
-    toolCalls
-  });
-
   log("info", "response.out", {
-    finishReason: response.choices[0].finish_reason,
     toolCalls: toolCalls.map((call) => call.name),
     textLength: text.length,
     rejectedCandidates: extracted.rejected.length
   });
 
-  if (body.stream === true) return sendOpenAISSE(res, response);
+  if (streamBridge) {
+    return streamBridge.finishWithPayload({ text, toolCalls });
+  }
+
+  const response = buildOpenAIResponse({
+    model: body.model,
+    text,
+    reasoningText: finalReasoning,
+    toolCalls
+  });
+
   return res.json(response);
+}
+
+/* -------------------------------------------------------------------------- */
+/*             流式流转桥接器 (Thinking 实时流 / 正文整流缓存)                 */
+/* -------------------------------------------------------------------------- */
+
+class AnthropicStreamBridge {
+  constructor(res, requestModel, requestId, log) {
+    this.res = res;
+    this.requestModel = requestModel || "claude-sonnet-x";
+    this.requestId = requestId;
+    this.log = log;
+    this.msgId = `msg_${uuid()}`;
+    this.started = false;
+    this.thinkingStarted = false;
+    this.thinkingEnded = false;
+    this.currentIndex = 0;
+  }
+
+  ensureStarted(inputTokens = 0) {
+    if (this.started) return;
+    setupSSE(this.res);
+    sseSend(this.res, "message_start", {
+      type: "message_start",
+      message: {
+        id: this.msgId,
+        type: "message",
+        role: "assistant",
+        model: this.requestModel,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: inputTokens, output_tokens: 0 }
+      }
+    });
+    this.started = true;
+  }
+
+  emitThinkingDelta(thinkingChunk, inputTokens = 0) {
+    if (!thinkingChunk) return;
+    this.ensureStarted(inputTokens);
+
+    if (!this.thinkingStarted) {
+      sseSend(this.res, "content_block_start", {
+        type: "content_block_start",
+        index: this.currentIndex,
+        content_block: { type: "thinking", thinking: "" }
+      });
+      this.thinkingStarted = true;
+    }
+
+    sseSend(this.res, "content_block_delta", {
+      type: "content_block_delta",
+      index: this.currentIndex,
+      delta: { type: "thinking_delta", thinking: thinkingChunk }
+    });
+  }
+
+  finishThinking() {
+    if (this.thinkingStarted && !this.thinkingEnded) {
+      sseSend(this.res, "content_block_delta", {
+        type: "content_block_delta",
+        index: this.currentIndex,
+        delta: { type: "signature_delta", signature: DUMMY_THINKING_SIGNATURE }
+      });
+      sseSend(this.res, "content_block_stop", {
+        type: "content_block_stop",
+        index: this.currentIndex
+      });
+      this.thinkingEnded = true;
+      this.currentIndex++;
+    }
+  }
+
+  finishWithPayload({ text, toolCalls, inputTokens, outputTokens }) {
+    this.ensureStarted(inputTokens);
+    this.finishThinking();
+
+    // 1. 发送清洗适配后的正文
+    if (text) {
+      sseSend(this.res, "content_block_start", {
+        type: "content_block_start",
+        index: this.currentIndex,
+        content_block: { type: "text", text: "" }
+      });
+      sseSend(this.res, "content_block_delta", {
+        type: "content_block_delta",
+        index: this.currentIndex,
+        delta: { type: "text_delta", text }
+      });
+      sseSend(this.res, "content_block_stop", {
+        type: "content_block_stop",
+        index: this.currentIndex
+      });
+      this.currentIndex++;
+    }
+
+    // 2. 发送提取出的 Tool Use 块
+    for (const call of toolCalls) {
+      sseSend(this.res, "content_block_start", {
+        type: "content_block_start",
+        index: this.currentIndex,
+        content_block: {
+          type: "tool_use",
+          id: call.id,
+          name: call.name,
+          input: {}
+        }
+      });
+      sseSend(this.res, "content_block_delta", {
+        type: "content_block_delta",
+        index: this.currentIndex,
+        delta: {
+          type: "input_json_delta",
+          partial_json: JSON.stringify(call.arguments || {})
+        }
+      });
+      sseSend(this.res, "content_block_stop", {
+        type: "content_block_stop",
+        index: this.currentIndex
+      });
+      this.currentIndex++;
+    }
+
+    const stopReason = toolCalls.length ? "tool_use" : "end_turn";
+
+    sseSend(this.res, "message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: outputTokens }
+    });
+
+    sseSend(this.res, "message_stop", { type: "message_stop" });
+    this.res.end();
+  }
+}
+
+class OpenAIStreamBridge {
+  constructor(res, model) {
+    this.res = res;
+    this.model = model || "tool-bridge-model";
+    this.id = `chatcmpl_${uuid()}`;
+    this.created = Math.floor(Date.now() / 1000);
+    this.started = false;
+  }
+
+  ensureStarted() {
+    if (this.started) return;
+    setupSSE(this.res);
+    this.sendDelta({ role: "assistant" });
+    this.started = true;
+  }
+
+  sendDelta(delta, finishReason = null) {
+    this.res.write(
+      `data: ${JSON.stringify({
+        id: this.id,
+        object: "chat.completion.chunk",
+        created: this.created,
+        model: this.model,
+        choices: [{ index: 0, delta, finish_reason: finishReason }]
+      })}\n\n`
+    );
+  }
+
+  emitReasoningDelta(reasoningChunk) {
+    if (!reasoningChunk) return;
+    this.ensureStarted();
+    this.sendDelta({ reasoning_content: reasoningChunk });
+  }
+
+  finishWithPayload({ text, toolCalls }) {
+    this.ensureStarted();
+
+    if (text) {
+      this.sendDelta({ content: text });
+    }
+
+    for (let index = 0; index < (toolCalls?.length || 0); index++) {
+      const call = toolCalls[index];
+      this.sendDelta({
+        tool_calls: [
+          {
+            index,
+            id: `call_${call.id}`,
+            type: "function",
+            function: { name: call.name, arguments: "" }
+          }
+        ]
+      });
+      this.sendDelta({
+        tool_calls: [
+          {
+            index,
+            function: { arguments: JSON.stringify(call.arguments || {}) }
+          }
+        ]
+      });
+    }
+
+    this.sendDelta({}, toolCalls?.length ? "tool_calls" : "stop");
+    this.res.write("data: [DONE]\n\n");
+    this.res.end();
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                        上游流式读取解析器 (SSE Parser)                      */
+/* -------------------------------------------------------------------------- */
+
+async function* readSSE(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+
+      let eventType = null;
+      let dataLines = [];
+
+      for (const line of lines) {
+        if (line.startsWith("event:")) {
+          eventType = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trim());
+        } else if (line === "") {
+          if (dataLines.length > 0) {
+            yield { event: eventType, data: dataLines.join("\n") };
+            eventType = null;
+            dataLines = [];
+          }
+        }
+      }
+    }
+
+    if (buffer.trim()) {
+      const lines = buffer.split(/\r?\n/);
+      let eventType = null;
+      let dataLines = [];
+      for (const line of lines) {
+        if (line.startsWith("event:")) eventType = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+      }
+      if (dataLines.length > 0) {
+        yield { event: eventType, data: dataLines.join("\n") };
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function consumeAnthropicStream(response, onThinkingDelta) {
+  let rawText = "";
+  let reasoningText = "";
+
+  for await (const { data } of readSSE(response)) {
+    if (!data || data === "[DONE]") continue;
+    let payload;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      continue;
+    }
+
+    if (payload.type === "content_block_delta") {
+      const delta = payload.delta;
+      if (delta?.type === "thinking_delta" && delta.thinking) {
+        reasoningText += delta.thinking;
+        if (onThinkingDelta) onThinkingDelta(delta.thinking);
+      } else if (delta?.type === "text_delta" && delta.text) {
+        rawText += delta.text;
+      }
+    }
+  }
+
+  return { rawText, reasoningText };
+}
+
+async function consumeOpenAIStream(response, onThinkingDelta) {
+  let rawText = "";
+  let reasoningText = "";
+  const nativeToolCallMap = new Map();
+
+  for await (const { data } of readSSE(response)) {
+    if (!data) continue;
+    if (data === "[DONE]") break;
+
+    let payload;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      continue;
+    }
+
+    const choice = payload.choices?.[0];
+    const delta = choice?.delta;
+    if (!delta) continue;
+
+    const thinkingChunk = delta.reasoning_content || delta.reasoning || "";
+    if (thinkingChunk) {
+      reasoningText += thinkingChunk;
+      if (onThinkingDelta) onThinkingDelta(thinkingChunk);
+    }
+
+    if (delta.content) {
+      rawText += delta.content;
+    }
+
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const idx = tc.index ?? 0;
+        if (!nativeToolCallMap.has(idx)) {
+          nativeToolCallMap.set(idx, {
+            id: tc.id || "",
+            name: tc.function?.name || "",
+            arguments: tc.function?.arguments || ""
+          });
+        } else {
+          const item = nativeToolCallMap.get(idx);
+          if (tc.id) item.id = tc.id;
+          if (tc.function?.name) item.name += tc.function.name;
+          if (tc.function?.arguments) item.arguments += tc.function.arguments;
+        }
+      }
+    }
+  }
+
+  return {
+    rawText,
+    reasoningText,
+    nativeToolCalls: Array.from(nativeToolCallMap.values()).map((c) => ({
+      id: c.id,
+      function: { name: c.name, arguments: c.arguments }
+    }))
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -995,27 +1195,12 @@ function normalizeOpenAITools(body) {
 
 function dedupeTools(tools) {
   const seen = new Set();
+
   return tools.filter((tool) => {
     if (seen.has(tool.name)) return false;
     seen.add(tool.name);
     return true;
   });
-}
-
-function accumulateOpenAIToolCalls(target, incoming) {
-  for (const item of incoming) {
-    const idx = item.index ?? 0;
-    if (!target[idx]) {
-      target[idx] = {
-        id: item.id || "",
-        type: "function",
-        function: { name: "", arguments: "" }
-      };
-    }
-    if (item.id) target[idx].id = item.id;
-    if (item.function?.name) target[idx].function.name += item.function.name;
-    if (item.function?.arguments) target[idx].function.arguments += item.function.arguments;
-  }
 }
 
 function extractNativeOpenAIToolCalls(message, tools, tuning = adapt.DEFAULT_TUNING) {
@@ -1124,82 +1309,104 @@ function recordOutbound(origin) {
   return recent.length;
 }
 
-/**
- * 专门用于向上游发起 SSE 流式请求并逐行解析的通用处理函数
- */
-async function callUpstreamSSE(
-  incomingReq,
-  requestId,
-  targetUrl,
-  body,
-  onEvent,
-  customTimeout = UPSTREAM_TIMEOUT_MS
-) {
+async function fetchUpstreamStreamWithRetry(requestId, targetUrl, options, timeoutMs = UPSTREAM_TIMEOUT_MS) {
   const log = logBus.scoped(requestId);
-  const payload = JSON.stringify(cleanUndefined(body));
+  const targetKey = new URL(targetUrl).origin;
 
-  log("debug", "upstream.request_stream", {
-    url: String(targetUrl),
-    model: body.model,
-    messageCount: body.messages?.length,
-    payloadChars: payload.length
-  });
-
-  const response = await safeFetch(
-    targetUrl,
-    {
-      method: "POST",
-      headers: {
-        ...buildUpstreamHeaders(incomingReq),
-        "Content-Type": "application/json",
-        Accept: "text/event-stream, application/json"
-      },
-      body: payload
-    },
-    customTimeout
-  );
-
-  if (!response.ok) {
-    const raw = await response.text();
-    throw httpError(response.status, `Upstream stream error ${response.status}: ${raw.slice(0, 500)}`);
+  const cooldown = rateLimitState.get(targetKey);
+  if (cooldown && cooldown.until > Date.now()) {
+    const remaining = Math.ceil((cooldown.until - Date.now()) / 1000);
+    throw httpError(
+      429,
+      `Upstream rate-limit cooldown is active for ${remaining}s. ` +
+        `The bridge did not send another request to ${targetKey}.`
+    );
   }
+  if (cooldown) rateLimitState.delete(targetKey);
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  for (let attempt = 1; attempt <= UPSTREAM_MAX_ATTEMPTS; attempt++) {
+    const throttledMs = await throttleOutbound(
+      targetKey,
+      runtimeConfig.upstreamMinIntervalMs
+    );
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+    const startedAt = Date.now();
+    const outboundLast60s = recordOutbound(targetKey);
+    const response = await safeFetch(targetUrl, options, timeoutMs);
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+    if (!response || !response.headers) {
+      throw httpError(502, "Bridge did not receive a valid Response object.");
+    }
 
-    let currentEvent = "message";
+    if (!response.ok) {
+      let raw = "";
+      try {
+        raw = await response.text();
+      } catch {}
 
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line) continue;
+      const durationMs = Date.now() - startedAt;
+      log("error", "upstream.response", {
+        attempt,
+        status: response.status,
+        statusText: response.statusText || "",
+        durationMs,
+        throttledMs,
+        outboundLast60s,
+        raw: runtimeConfig.logBodies ? raw : "[logBodies=false]"
+      });
 
-      if (line.startsWith("event:")) {
-        currentEvent = line.slice(6).trim();
+      if (response.status === 429) {
+        if (!rateLimitState.has(targetKey)) {
+          rateLimitState.set(targetKey, {
+            until: Date.now() + cooldownMsFor(response),
+            sourceStatus: 429
+          });
+        }
+      }
+
+      if (isRetryableStatus(response.status) && attempt < UPSTREAM_MAX_ATTEMPTS) {
+        const delay = getRetryDelayMs(response, attempt);
+        log("warn", "upstream.retry", { attempt, status: response.status, delayMs: delay });
+        await sleep(delay);
         continue;
       }
 
-      if (line.startsWith("data:")) {
-        const rawData = line.slice(5).trim();
-        if (rawData === "[DONE]") continue;
-
-        try {
-          const parsed = JSON.parse(rawData);
-          onEvent(currentEvent, parsed);
-        } catch {
-          // 忽略非 JSON 数据行
-        }
-      }
+      throw httpError(response.status, describeUpstreamError({ raw, response }));
     }
+
+    rateLimitState.delete(targetKey);
+    log("info", "upstream.stream_connected", {
+      attempt,
+      status: response.status,
+      contentType: response.headers.get("content-type") || ""
+    });
+
+    return response;
   }
+
+  throw httpError(502, "Upstream connection failed after retries.");
+}
+
+function describeUpstreamError(upstream) {
+  const { raw } = upstream;
+  const status = upstream.response.status;
+  const contentType = upstream.response.headers.get("content-type") || "";
+  const server = upstream.response.headers.get("server") || "";
+  const isHtml = contentType.includes("html") || /^\s*<!doctype html/i.test(raw);
+
+  let source = "上游服务商";
+
+  if (raw.includes("Just a moment...") || raw.includes("Cloudflare")) {
+    source = "Cloudflare WAF 拦截";
+  } else if (isHtml && status === 429) {
+    source = `平台层限流（返回的是 HTML 错误页${
+      server ? `，server: ${server}` : ""
+    }，没到模型 API）`;
+  } else if (isHtml) {
+    source = `平台层错误页${server ? `，server: ${server}` : ""}`;
+  }
+
+  return `Upstream error ${status} [${source}]: ${raw.slice(0, 500)}`;
 }
 
 async function passthroughRequest(req, res, requestId, targetUrl) {
@@ -1227,15 +1434,14 @@ async function fetchUpstreamWithRetry(requestId, targetUrl, options, timeoutMs =
   const targetKey = new URL(targetUrl).origin;
 
   const cooldown = rateLimitState.get(targetKey);
-
   if (cooldown && cooldown.until > Date.now()) {
     const remaining = Math.ceil((cooldown.until - Date.now()) / 1000);
     throw httpError(
       429,
-      `Upstream rate-limit cooldown is active for ${remaining}s.`
+      `Upstream rate-limit cooldown is active for ${remaining}s. ` +
+        `The bridge did not send another request to ${targetKey}.`
     );
   }
-
   if (cooldown) rateLimitState.delete(targetKey);
 
   let last = null;
@@ -1255,7 +1461,6 @@ async function fetchUpstreamWithRetry(requestId, targetUrl, options, timeoutMs =
     }
 
     let raw;
-
     try {
       raw = await response.text();
     } catch (error) {
@@ -1284,7 +1489,7 @@ async function fetchUpstreamWithRetry(requestId, targetUrl, options, timeoutMs =
     if (response.status === 429) {
       if (!rateLimitState.has(targetKey)) {
         rateLimitState.set(targetKey, {
-          until: Date.now() + 15000,
+          until: Date.now() + cooldownMsFor(response),
           sourceStatus: 429
         });
       }
@@ -1296,20 +1501,61 @@ async function fetchUpstreamWithRetry(requestId, targetUrl, options, timeoutMs =
       return last;
     }
 
-    await sleep(1500);
+    const delay = getRetryDelayMs(response, attempt);
+    log("warn", "upstream.retry", { attempt, status: response.status, delayMs: delay });
+    await sleep(delay);
   }
 
   return last;
+}
+
+function cooldownMsFor(response) {
+  const retryAfter = response.headers.get("retry-after");
+  const cap = 30000;
+
+  if (!retryAfter) return 15000;
+
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return Math.min(Math.ceil(seconds * 1000), cap);
+  }
+
+  const retryDate = Date.parse(retryAfter);
+  if (Number.isFinite(retryDate) && retryDate > Date.now()) {
+    return Math.min(retryDate - Date.now(), cap);
+  }
+
+  return 15000;
 }
 
 function isRetryableStatus(status) {
   return [502, 503, 504].includes(status);
 }
 
+function getRetryDelayMs(response, attempt) {
+  const retryAfter = response.headers.get("retry-after");
+
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return Math.min(Math.round(seconds * 1000), RETRY_MAX_DELAY_MS);
+    }
+
+    const asDate = Date.parse(retryAfter);
+    if (Number.isFinite(asDate)) {
+      return Math.min(Math.max(0, asDate - Date.now()), RETRY_MAX_DELAY_MS);
+    }
+  }
+
+  const base = response.status === 429 ? 3000 : 1200;
+  const jitter = Math.floor(Math.random() * 1000);
+
+  return Math.min(base * 2 ** (attempt - 1) + jitter, RETRY_MAX_DELAY_MS);
+}
+
 function buildUpstreamHeaders(req) {
   const headers = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     Accept: "application/json, */*"
   };
 
@@ -1429,56 +1675,6 @@ function sseSend(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-function sendOpenAISSE(res, response) {
-  setupSSE(res);
-
-  const choice = response.choices[0];
-  const message = choice.message;
-  const base = {
-    id: response.id,
-    object: "chat.completion.chunk",
-    created: response.created,
-    model: response.model
-  };
-
-  const send = (delta, finishReason = null) => {
-    res.write(
-      `data: ${JSON.stringify({
-        ...base,
-        choices: [{ index: 0, delta, finish_reason: finishReason }]
-      })}\n\n`
-    );
-  };
-
-  send({ role: "assistant" });
-
-  if (message.reasoning_content) send({ reasoning_content: message.reasoning_content });
-  if (message.content) send({ content: message.content });
-
-  for (let index = 0; index < (message.tool_calls?.length || 0); index++) {
-    const call = message.tool_calls[index];
-
-    send({
-      tool_calls: [
-        {
-          index,
-          id: call.id,
-          type: "function",
-          function: { name: call.function.name, arguments: "" }
-        }
-      ]
-    });
-
-    send({
-      tool_calls: [{ index, function: { arguments: call.function.arguments } }]
-    });
-  }
-
-  send({}, message.tool_calls?.length ? "tool_calls" : "stop");
-  res.write("data: [DONE]\n\n");
-  res.end();
-}
-
 /* -------------------------------------------------------------------------- */
 /*                                URL Security                                */
 /* -------------------------------------------------------------------------- */
@@ -1507,9 +1703,11 @@ function parseTargetFromPath(req) {
 
 function rewriteAnthropicMessagesToOpenAI(targetUrl) {
   const url = new URL(targetUrl);
+
   if (/\/v1\/messages?$/i.test(url.pathname)) {
     url.pathname = url.pathname.replace(/\/v1\/messages?$/i, "/v1/chat/completions");
   }
+
   return url;
 }
 
@@ -1548,6 +1746,7 @@ async function validateTargetUrl(url, req = null) {
   }
 
   let records;
+
   try {
     records = await dns.lookup(hostname, { all: true, verbatim: true });
   } catch {
@@ -1570,9 +1769,12 @@ async function validateTargetUrl(url, req = null) {
 
 function getIncomingPublicHost(req) {
   if (!req?.headers) return "";
+
   const forwarded = String(req.headers["x-forwarded-host"] || "").split(",")[0].trim();
   const host = forwarded || String(req.headers.host || "").trim();
+
   if (!host) return "";
+
   return host.replace(/:\d+$/, "").toLowerCase().replace(/\.$/, "");
 }
 
@@ -1637,6 +1839,7 @@ async function safeFetch(initialUrl, options, timeoutMs = UPSTREAM_TIMEOUT_MS) {
     if (!location) throw httpError(502, "Upstream redirect has no Location header.");
 
     const next = new URL(location, current);
+
     if (next.host !== current.host) {
       throw httpError(502, "Cross-host redirect is blocked to avoid credential leakage.");
     }
@@ -1656,6 +1859,7 @@ function hostAllowed(hostname) {
 function isPrivateIp(ip) {
   if (ip.includes(":")) {
     const normalized = ip.toLowerCase();
+
     if (
       normalized === "::1" ||
       normalized === "::" ||
@@ -1665,11 +1869,13 @@ function isPrivateIp(ip) {
     ) {
       return true;
     }
+
     const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
     return mapped ? isPrivateIp(mapped[1]) : false;
   }
 
   const [a, b] = ip.split(".").map(Number);
+
   return (
     a === 0 ||
     a === 10 ||
@@ -1694,6 +1900,7 @@ function currentPromptText() {
 function loadConfig() {
   try {
     if (!fs.existsSync(CONFIG_FILE)) return structuredClone(DEFAULT_CONFIG);
+
     const config = sanitizeConfig(JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")));
     config.toolPrompt = "";
     return config;
@@ -1716,6 +1923,7 @@ function saveConfig(config) {
 
 function sanitizeConfig(input) {
   const toolPrompt = String(input?.toolPrompt ?? "").trim();
+
   if (toolPrompt.length > 100000) throw new Error("toolPrompt is too large.");
 
   const promptId = adapt.getPreset(input?.promptId).id;
@@ -1766,6 +1974,7 @@ function ensureVisibleAssistantText(text, toolCalls, fallback) {
 
 function contentToText(content) {
   if (content === null || content === undefined) return "";
+
   if (
     typeof content === "string" ||
     typeof content === "number" ||
@@ -1788,6 +1997,7 @@ function contentToText(content) {
   }
 
   if (typeof content === "object") return content.text || JSON.stringify(content);
+
   return String(content);
 }
 
@@ -1822,6 +2032,7 @@ function estimateTokens(value) {
 
 function cleanUndefined(value) {
   if (Array.isArray(value)) return value.map(cleanUndefined);
+
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value)
@@ -1829,6 +2040,7 @@ function cleanUndefined(value) {
         .map(([key, item]) => [key, cleanUndefined(item)])
     );
   }
+
   return value;
 }
 
@@ -1858,11 +2070,15 @@ function httpError(status, message) {
   return error;
 }
 
-// 启动服务，并修复原本未保存 server 实例的问题
+/* -------------------------------------------------------------------------- */
+/*                               Server Startup                               */
+/* -------------------------------------------------------------------------- */
+
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`[tool-bridge] listening on port ${PORT}`);
 });
 
-server.requestTimeout = 1200000; // 20 分钟
-server.headersTimeout = 1200000;
-server.keepAliveTimeout = 60000;
+// 解除 Node.js 服务端默认的 5 分钟 (300000ms) 请求超时限制
+server.requestTimeout = 2400000; // 40 分钟
+server.headersTimeout = 2400000;
+server.keepAliveTimeout = 120000;

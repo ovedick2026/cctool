@@ -1806,3 +1806,8 @@ function httpError(status, message) {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`[tool-bridge] listening on port ${PORT}`);
 });
+
+// 增加这几行：解除 Node.js 服务端默认的 5 分钟 (300000ms) 请求超时限制
+server.requestTimeout = 1200000; // 20 分钟
+server.headersTimeout = 1200000;
+server.keepAliveTimeout = 60000;

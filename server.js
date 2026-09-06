@@ -643,7 +643,7 @@ async function handleOpenAIChat(req, res, requestId, targetUrl) {
 class AnthropicStreamBridge {
   constructor(res, requestModel, requestId, log) {
     this.res = res;
-    this.requestModel = requestModel || "claude-sonnet-x";
+    this.requestModel = requestModel || "claude-sonnet-d";
     this.requestId = requestId;
     this.log = log;
     this.msgId = `msg_${uuid()}`;
@@ -651,6 +651,21 @@ class AnthropicStreamBridge {
     this.thinkingStarted = false;
     this.thinkingEnded = false;
     this.currentIndex = 0;
+
+    // 【关键修复 1】：只要是流式请求，立即向下游客户端发送 HTTP 200 和 message_start，绝不等待！
+    this.ensureStarted(0);
+
+    // 【关键修复 2】：启动 SSE 心跳保活定时器（每 15 秒向客户端发送注释心跳行）
+    // 这样 Node.js 底层、Claude Code 看门狗、各种反向代理绝不会因为“无数据”而断开
+    this.keepAliveTimer = setInterval(() => {
+      try {
+        if (!this.res.writableEnded) {
+          this.res.write(": keep-alive\n\n");
+        }
+      } catch (e) {
+        clearInterval(this.keepAliveTimer);
+      }
+    }, 15000);
   }
 
   ensureStarted(inputTokens = 0) {
@@ -709,6 +724,7 @@ class AnthropicStreamBridge {
   }
 
   finishWithPayload({ text, toolCalls, inputTokens, outputTokens }) {
+    if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
     this.ensureStarted(inputTokens);
     this.finishThinking();
 

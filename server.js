@@ -390,7 +390,8 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
         max_tokens: body.max_tokens || 4096,
         temperature: body.temperature,
         top_p: body.top_p,
-        stream: true // 开启流式
+        thinking: body.thinking, // <--- 加上这一行透传
+        stream: true
       });
 
       const probeTimeout = cachedProtocol === "anthropic" ? UPSTREAM_TIMEOUT_MS : 60000;
@@ -923,6 +924,9 @@ async function consumeOpenAIStream(response, onThinkingDelta) {
   let reasoningText = "";
   const nativeToolCallMap = new Map();
 
+  // 增加流式状态机：跟踪是否当前处于  标签内部
+  let inThinkTag = false;
+
   for await (const { data } of readSSE(response)) {
     if (!data) continue;
     if (data === "[DONE]") break;
@@ -938,14 +942,49 @@ async function consumeOpenAIStream(response, onThinkingDelta) {
     const delta = choice?.delta;
     if (!delta) continue;
 
+    // 1. 处理官方标准的 reasoning_content (如 DeepSeek 官方 API)
     const thinkingChunk = delta.reasoning_content || delta.reasoning || "";
     if (thinkingChunk) {
       reasoningText += thinkingChunk;
       if (onThinkingDelta) onThinkingDelta(thinkingChunk);
     }
 
+    // 2. 处理夹在 content 里的  标签（解决思考不流式的元凶！）
     if (delta.content) {
-      rawText += delta.content;
+      let content = delta.content;
+
+      // 检测  起始
+      if (!inThinkTag && content.includes("")) {
+        inThinkTag = true;
+        const parts = content.split("");
+        //  前面如果有正文则保留
+        if (parts[0]) rawText += parts[0];
+        content = parts.slice(1).join("");
+      }
+
+      // 如果当前正处于思考流中
+      if (inThinkTag) {
+        if (content.includes("<think>")) {
+          // 思考结束
+          inThinkTag = false;
+          const parts = content.split("</think>");
+          const thinkPart = parts[0];
+          const postPart = parts.slice(1).join("</think>");
+
+          if (thinkPart) {
+            reasoningText += thinkPart;
+            if (onThinkingDelta) onThinkingDelta(thinkPart);
+          }
+          if (postPart) rawText += postPart;
+        } else {
+          // 全量思考中，立即实时下发给 CloudCLI！
+          reasoningText += content;
+          if (onThinkingDelta) onThinkingDelta(content);
+        }
+      } else {
+        // 正常正文，存入 buffer 供后续提取工具
+        rawText += content;
+      }
     }
 
     if (Array.isArray(delta.tool_calls)) {

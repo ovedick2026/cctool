@@ -354,11 +354,16 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     renderedMessages.push({ role: "user", content: repeatWarning });
   }
 
-  // 构建下游流式桥接器（仅当客户端要求流式时初始化）
+  // 构建下游流式桥接器
   const isClientStream = body.stream === true;
   const streamBridge = isClientStream
     ? new AnthropicStreamBridge(res, body.model, requestId, log)
     : null;
+
+  // 【核心修复】：只要是流式，立即响应下游 Claude Code 并开启 Thinking 状态
+  if (streamBridge) {
+    streamBridge.startThinkingEarly(estimateTokens(body));
+  }
 
   // 思考流回调：只要上游吐出思考增量，立即流式下发下游
   const onThinkingDelta = (chunk) => {
@@ -372,7 +377,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
 
   const cachedProtocol = endpointProtocolCache.get(hostOrigin);
 
-  // 1. 【改动处 1】：若支持 Anthropic，使用流式向 /v1/messages 发起请求
+  // 1. 若支持 Anthropic，使用流式向 /v1/messages 发起请求
   if (cachedProtocol !== "openai") {
     try {
       log("info", "upstream.attempt", { mode: "anthropic_messages_stream", url: String(originalTargetUrl) });
@@ -390,11 +395,11 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
         max_tokens: body.max_tokens || 4096,
         temperature: body.temperature,
         top_p: body.top_p,
-        thinking: body.thinking, // <--- 加上这一行透传
+        thinking: body.thinking,
         stream: true
       });
 
-      const probeTimeout = cachedProtocol === "anthropic" ? UPSTREAM_TIMEOUT_MS : 60000;
+      const probeTimeout = cachedProtocol === "anthropic" ? UPSTREAM_TIMEOUT_MS : 30000;
       const upstreamResponse = await fetchUpstreamStreamWithRetry(requestId, originalTargetUrl, {
         method: "POST",
         headers: {
@@ -422,7 +427,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     }
   }
 
-  // 2. 【改动处 2】：Fallback 到 OpenAI 接口，使用流式发起请求
+  // 2. Fallback 到 OpenAI 接口，使用流式发起请求
   if (!success) {
     log("info", "upstream.attempt", { mode: "openai_chat_fallback_stream" });
 
@@ -439,7 +444,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
       temperature: body.temperature,
       top_p: body.top_p,
       stop: orUndefined(adapt.buildStopSequences(body.stop_sequences || body.stop, tools, tuning)),
-      stream: true // 开启流式
+      stream: true
     });
 
     const upstreamUrl = rewriteAnthropicMessagesToOpenAI(originalTargetUrl);
@@ -459,12 +464,15 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     nativeToolCalls = result.nativeToolCalls || [];
   }
 
-  // 流彻底结束，关闭下游思考块（若开启过）
+  // 流彻底结束，关闭下游思考块
   if (streamBridge) streamBridge.finishThinking();
 
   // 兜底提取可能夹在正文中的<think>
-  const { text: cleanText, thinking } = adapt.splitThinking(rawText);
+  const { text: splitCleanText, thinking } = adapt.splitThinking(rawText);
   if (!reasoningText && thinking) reasoningText = thinking;
+
+  // 【核心修复】：容错处理缺失左括号的 "tool_call>"，补齐为 "<tool_call>"
+  let cleanText = splitCleanText.replace(/(^|\n)\s*tool_call>/g, "$1<tool_call>");
 
   // 正文缓冲提取工具调用
   const extracted = adapt.extractToolCalls(cleanText, tools, tuning, log, () =>
@@ -495,7 +503,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     rejectedCandidates: extracted.rejected.length
   });
 
-  // 如果下游是流式，将抽取规整后的正文与工具调用推完收尾
+  // 流式收尾
   if (streamBridge) {
     return streamBridge.finishWithPayload({
       text,
@@ -505,7 +513,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     });
   }
 
-  // 非流式请求直接响应标准 JSON
+  // 非流式响应
   const response = buildAnthropicResponse({
     requestModel: body.model,
     text,
@@ -643,7 +651,7 @@ async function handleOpenAIChat(req, res, requestId, targetUrl) {
 class AnthropicStreamBridge {
   constructor(res, requestModel, requestId, log) {
     this.res = res;
-    this.requestModel = requestModel || "claude-sonnet-d";
+    this.requestModel = requestModel || "claude-sonnet-x";
     this.requestId = requestId;
     this.log = log;
     this.msgId = `msg_${uuid()}`;
@@ -652,20 +660,29 @@ class AnthropicStreamBridge {
     this.thinkingEnded = false;
     this.currentIndex = 0;
 
-    // 【关键修复 1】：只要是流式请求，立即向下游客户端发送 HTTP 200 和 message_start，绝不等待！
-    this.ensureStarted(0);
-
-    // 【关键修复 2】：启动 SSE 心跳保活定时器（每 15 秒向客户端发送注释心跳行）
-    // 这样 Node.js 底层、Claude Code 看门狗、各种反向代理绝不会因为“无数据”而断开
+    // 【核心修复】：向下游 Claude Code 持续发送心跳，防止任何网络节点超时断开
     this.keepAliveTimer = setInterval(() => {
       try {
         if (!this.res.writableEnded) {
           this.res.write(": keep-alive\n\n");
         }
-      } catch (e) {
+      } catch {
         clearInterval(this.keepAliveTimer);
       }
     }, 15000);
+  }
+
+  // 立即开始思考：收到请求后立刻向下游发送 message_start 和 thinking 块
+  startThinkingEarly(inputTokens = 0) {
+    this.ensureStarted(inputTokens);
+    if (!this.thinkingStarted) {
+      sseSend(this.res, "content_block_start", {
+        type: "content_block_start",
+        index: this.currentIndex,
+        content_block: { type: "thinking", thinking: "" }
+      });
+      this.thinkingStarted = true;
+    }
   }
 
   ensureStarted(inputTokens = 0) {
@@ -689,16 +706,7 @@ class AnthropicStreamBridge {
 
   emitThinkingDelta(thinkingChunk, inputTokens = 0) {
     if (!thinkingChunk) return;
-    this.ensureStarted(inputTokens);
-
-    if (!this.thinkingStarted) {
-      sseSend(this.res, "content_block_start", {
-        type: "content_block_start",
-        index: this.currentIndex,
-        content_block: { type: "thinking", thinking: "" }
-      });
-      this.thinkingStarted = true;
-    }
+    this.startThinkingEarly(inputTokens);
 
     sseSend(this.res, "content_block_delta", {
       type: "content_block_delta",
@@ -725,6 +733,7 @@ class AnthropicStreamBridge {
 
   finishWithPayload({ text, toolCalls, inputTokens, outputTokens }) {
     if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
+
     this.ensureStarted(inputTokens);
     this.finishThinking();
 
@@ -940,9 +949,6 @@ async function consumeOpenAIStream(response, onThinkingDelta) {
   let reasoningText = "";
   const nativeToolCallMap = new Map();
 
-  // 增加流式状态机：跟踪是否当前处于  标签内部
-  let inThinkTag = false;
-
   for await (const { data } of readSSE(response)) {
     if (!data) continue;
     if (data === "[DONE]") break;
@@ -958,51 +964,19 @@ async function consumeOpenAIStream(response, onThinkingDelta) {
     const delta = choice?.delta;
     if (!delta) continue;
 
-    // 1. 处理官方标准的 reasoning_content (如 DeepSeek 官方 API)
-    const thinkingChunk = delta.reasoning_content || delta.reasoning || "";
+    // 1. 优先提取标准思考字段 (GLM/DeepSeek 格式)
+    const thinkingChunk = delta.reasoning_content || delta.reasoning || delta.thinking_content || "";
     if (thinkingChunk) {
       reasoningText += thinkingChunk;
       if (onThinkingDelta) onThinkingDelta(thinkingChunk);
     }
 
-    // 2. 处理夹在 content 里的  标签（解决思考不流式的元凶！）
+    // 2. 正文字段
     if (delta.content) {
-      let content = delta.content;
-
-      // 检测  起始
-      if (!inThinkTag && content.includes("")) {
-        inThinkTag = true;
-        const parts = content.split("");
-        //  前面如果有正文则保留
-        if (parts[0]) rawText += parts[0];
-        content = parts.slice(1).join("");
-      }
-
-      // 如果当前正处于思考流中
-      if (inThinkTag) {
-        if (content.includes("<think>")) {
-          // 思考结束
-          inThinkTag = false;
-          const parts = content.split("</think>");
-          const thinkPart = parts[0];
-          const postPart = parts.slice(1).join("</think>");
-
-          if (thinkPart) {
-            reasoningText += thinkPart;
-            if (onThinkingDelta) onThinkingDelta(thinkPart);
-          }
-          if (postPart) rawText += postPart;
-        } else {
-          // 全量思考中，立即实时下发给 CloudCLI！
-          reasoningText += content;
-          if (onThinkingDelta) onThinkingDelta(content);
-        }
-      } else {
-        // 正常正文，存入 buffer 供后续提取工具
-        rawText += content;
-      }
+      rawText += delta.content;
     }
 
+    // 3. 原生工具调用字段
     if (Array.isArray(delta.tool_calls)) {
       for (const tc of delta.tool_calls) {
         const idx = tc.index ?? 0;

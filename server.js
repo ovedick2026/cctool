@@ -275,7 +275,7 @@ app.use(async (req, res) => {
     }
 
     if (req.method === "POST" && (pathname.endsWith("/v1/messages") || pathname.endsWith("/v1/message"))) {
-      return await handleAnthropicMessages(req, res, requestId, targetUrl);
+      return await (req, res, requestId, targetUrl);
     }
 
     if (req.method === "POST" && pathname.endsWith("/v1/chat/completions")) {
@@ -325,13 +325,12 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
   const body = req.body || {};
   const tuning = runtimeConfig.tuning;
   const tools = normalizeAnthropicTools(body.tools || []);
-  const hostOrigin = originalTargetUrl.origin;
 
-  // 【核心新增 1】：创建下游与上游联动的 AbortController
+  // 客户端断开连接联动
   const clientAbortController = new AbortController();
   req.on("close", () => {
     if (!res.writableEnded) {
-      log("warn", "client.disconnected", { hint: "CloudCLI 已断开连接，立即向终止上游请求" });
+      log("warn", "client.disconnected", { hint: "下游连接断开，终止上游请求" });
       clientAbortController.abort();
     }
   });
@@ -351,7 +350,6 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
   const conversation = anthropicToConversation(body);
   const compressed = adapt.compressHistory(conversation, tuning, log);
   const renderedMessages = adapt.renderConversation(compressed, tuning, log);
-
   const toolPrompt = adapt.renderToolPrompt(tools, body.tool_choice, {
     promptText: currentPromptText(),
     tuning
@@ -368,129 +366,140 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     ? new AnthropicStreamBridge(res, body.model, requestId, log)
     : null;
 
-  if (streamBridge) {
-    streamBridge.startThinkingEarly(estimateTokens(body));
+  // 1. 组装 OpenAI 格式请求报文（统一直接走 /v1/chat/completions）
+  const messages = [];
+  if (runtimeConfig.includeOriginalSystem && compressed.system) {
+    messages.push({ role: "system", content: compressed.system });
   }
+  if (toolPrompt) messages.push({ role: "system", content: toolPrompt });
+  messages.push(...renderedMessages);
 
-  const onThinkingDelta = (chunk) => {
-    if (streamBridge) streamBridge.emitThinkingDelta(chunk, estimateTokens(body));
-  };
+  const openAIBody = cleanUndefined({
+    model: resolveModel(body.model),
+    messages,
+    temperature: body.temperature,
+    top_p: body.top_p,
+    stop: orUndefined(adapt.buildStopSequences(body.stop_sequences || body.stop, tools, tuning)),
+    stream: true
+  });
 
-  let rawText = "";
+  // 强制转为 OpenAI completions 接口
+  const upstreamUrl = rewriteAnthropicMessagesToOpenAI(originalTargetUrl);
+
+  log("info", "upstream.attempt", { mode: "direct_openai_stream", url: String(upstreamUrl) });
+
+  const upstreamResponse = await fetchUpstreamStreamWithRetry(
+    requestId,
+    upstreamUrl,
+    {
+      method: "POST",
+      headers: {
+        ...buildUpstreamHeaders(req),
+        "Content-Type": "application/json",
+        Accept: "text/event-stream, application/json"
+      },
+      body: JSON.stringify(openAIBody),
+      signal: clientAbortController.signal
+    }
+  );
+
+  // 2. 实时流式解析 OpenAI 上游并转发思考流
+  let rawContentText = "";
   let reasoningText = "";
-  let nativeToolCalls = [];
-  let success = false;
+  const nativeToolCallMap = new Map();
+  let inThinkTag = false;
 
-  const cachedProtocol = endpointProtocolCache.get(hostOrigin);
+  for await (const { data } of readSSE(upstreamResponse)) {
+    if (clientAbortController.signal.aborted) return;
+    if (!data) continue;
+    if (data === "[DONE]") break;
 
-  // 1. 若支持 Anthropic，使用流式发起请求
-  if (cachedProtocol !== "openai") {
+    let payload;
     try {
-      log("info", "upstream.attempt", { mode: "anthropic_messages_stream", url: String(originalTargetUrl) });
-
-      const systemParts = [];
-      if (runtimeConfig.includeOriginalSystem && compressed.system) {
-        systemParts.push(compressed.system);
-      }
-      if (toolPrompt) systemParts.push(toolPrompt);
-
-      const anthropicBody = cleanUndefined({
-        model: resolveModel(body.model),
-        messages: renderedMessages,
-        system: systemParts.join("\n\n") || undefined,
-        max_tokens: body.max_tokens || 4096,
-        temperature: body.temperature,
-        top_p: body.top_p,
-        thinking: body.thinking,
-        stream: true
-      });
-
-      const probeTimeout = cachedProtocol === "anthropic" ? UPSTREAM_TIMEOUT_MS : 30000;
-      const upstreamResponse = await fetchUpstreamStreamWithRetry(
-        requestId,
-        originalTargetUrl,
-        {
-          method: "POST",
-          headers: {
-            ...buildUpstreamHeaders(req),
-            "Content-Type": "application/json",
-            Accept: "text/event-stream, application/json"
-          },
-          body: JSON.stringify(anthropicBody),
-          signal: clientAbortController.signal // 传入客户端中断信号
-        },
-        probeTimeout
-      );
-
-      const result = await consumeAnthropicStream(upstreamResponse, onThinkingDelta);
-      rawText = result.rawText;
-      reasoningText = result.reasoningText;
-      success = true;
-      endpointProtocolCache.set(hostOrigin, "anthropic");
-    } catch (messagesError) {
-      if (clientAbortController.signal.aborted) return; // 客户端主动取消则直接返回
-      if (messagesError?.status && messagesError.status !== 404) {
-        throw messagesError;
-      }
-      log("warn", "upstream.messages_failed", {
-        message: messagesError?.message || String(messagesError),
-        hint: "切换上游为 OpenAI /v1/chat/completions 接口"
-      });
-      endpointProtocolCache.set(hostOrigin, "openai");
+      payload = JSON.parse(data);
+    } catch {
+      continue;
     }
-  }
 
-  // 2. Fallback 到 OpenAI 接口
-  if (!success && !clientAbortController.signal.aborted) {
-    log("info", "upstream.attempt", { mode: "openai_chat_fallback_stream" });
+    const choice = payload.choices?.[0];
+    const delta = choice?.delta;
+    if (!delta) continue;
 
-    const messages = [];
-    if (runtimeConfig.includeOriginalSystem && compressed.system) {
-      messages.push({ role: "system", content: compressed.system });
+    // A. 提取原生 reasoning_content (DeepSeek API / vLLM / NewAPI 字段)
+    const thinkingChunk = delta.reasoning_content || delta.reasoning || delta.thinking_content || "";
+    if (thinkingChunk) {
+      reasoningText += thinkingChunk;
+      if (streamBridge) streamBridge.emitThinkingDelta(thinkingChunk, estimateTokens(body));
     }
-    if (toolPrompt) messages.push({ role: "system", content: toolPrompt });
-    messages.push(...renderedMessages);
 
-    const openAIBody = cleanUndefined({
-      model: resolveModel(body.model),
-      messages,
-      temperature: body.temperature,
-      top_p: body.top_p,
-      stop: orUndefined(adapt.buildStopSequences(body.stop_sequences || body.stop, tools, tuning)),
-      stream: true
-    });
+    // B. 处理正文 delta.content，同时兼顾模型自行输出的 <think> 标签
+    if (delta.content) {
+      let contentChunk = delta.content;
 
-    const upstreamUrl = rewriteAnthropicMessagesToOpenAI(originalTargetUrl);
-    const upstreamResponse = await fetchUpstreamStreamWithRetry(
-      requestId,
-      upstreamUrl,
-      {
-        method: "POST",
-        headers: {
-          ...buildUpstreamHeaders(req),
-          "Content-Type": "application/json",
-          Accept: "text/event-stream, application/json"
-        },
-        body: JSON.stringify(openAIBody),
-        signal: clientAbortController.signal // 传入客户端中断信号
+      while (contentChunk.length > 0) {
+        if (!inThinkTag) {
+          const thinkStartIdx = contentChunk.indexOf("");
+          if (thinkStartIdx !== -1) {
+            //  之前的是普通正文
+            const beforePiece = contentChunk.slice(0, thinkStartIdx);
+            rawContentText += beforePiece;
+
+            inThinkTag = true;
+            contentChunk = contentChunk.slice(thinkStartIdx + 7); // 剥离 ""
+          } else {
+            rawContentText += contentChunk;
+            contentChunk = "";
+          }
+        } else {
+          // 当前正处于  思考中
+          const thinkEndIdx = contentChunk.indexOf("<think>");
+          if (thinkEndIdx !== -1) {
+            const thinkPiece = contentChunk.slice(0, thinkEndIdx);
+            reasoningText += thinkPiece;
+            if (streamBridge && thinkPiece) {
+              streamBridge.emitThinkingDelta(thinkPiece, estimateTokens(body));
+            }
+            inThinkTag = false;
+            contentChunk = contentChunk.slice(thinkEndIdx + 8); // 剥离 "</think>"
+          } else {
+            // 全块都属于思考内容，实时流式发射给 Claude Code
+            reasoningText += contentChunk;
+            if (streamBridge) {
+              streamBridge.emitThinkingDelta(contentChunk, estimateTokens(body));
+            }
+            contentChunk = "";
+          }
+        }
       }
-    );
+    }
 
-    const result = await consumeOpenAIStream(upstreamResponse, onThinkingDelta);
-    rawText = result.rawText;
-    reasoningText = result.reasoningText;
-    nativeToolCalls = result.nativeToolCalls || [];
+    // C. 收集原生工具调用
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const idx = tc.index ?? 0;
+        if (!nativeToolCallMap.has(idx)) {
+          nativeToolCallMap.set(idx, {
+            id: tc.id || "",
+            name: tc.function?.name || "",
+            arguments: tc.function?.arguments || ""
+          });
+        } else {
+          const item = nativeToolCallMap.get(idx);
+          if (tc.id) item.id = tc.id;
+          if (tc.function?.name) item.name += tc.function.name;
+          if (tc.function?.arguments) item.arguments += tc.function.arguments;
+        }
+      }
+    }
   }
 
   if (clientAbortController.signal.aborted) return;
 
+  // 思考部分传输完毕，向下游关闭 thinking block
   if (streamBridge) streamBridge.finishThinking();
 
-  // 兜底提取可能夹在正文中的<think>
-    const { text: cleanText, thinking } = adapt.splitThinking(rawText);
-  if (!reasoningText && thinking) reasoningText = thinking;
-
-  // 正文容错：如果模型输出了缺失尖括号的 tool_call>，自动补齐
+  // 3. 正文兜底容错与工具提取
+  const { text: cleanText } = adapt.splitThinking(rawContentText);
   let sanitizedText = cleanText;
   if (sanitizedText.includes("tool_call>") && !sanitizedText.includes("<tool_call>")) {
     sanitizedText = sanitizedText.replace(/(?<!<)tool_call>/g, "<tool_call>");
@@ -500,14 +509,17 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     `toolu_${uuid()}`
   );
 
+  const nativeToolCalls = Array.from(nativeToolCallMap.values()).map((c) => ({
+    id: c.id,
+    function: { name: c.name, arguments: c.arguments }
+  }));
+
   const nativeExtracted = extractNativeOpenAIToolCalls(
     { tool_calls: nativeToolCalls },
     tools,
     tuning
   );
-
   const toolCalls = mergeToolCalls([nativeExtracted, extracted.toolCalls], tuning);
-
   const text = ensureVisibleAssistantText(
     extracted.content,
     toolCalls,
@@ -524,12 +536,13 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     rejectedCandidates: extracted.rejected.length
   });
 
+  // 4. 响应给下游
   if (streamBridge) {
     return streamBridge.finishWithPayload({
       text,
       toolCalls,
       inputTokens: estimateTokens(body),
-      outputTokens: estimateTokens(rawText + reasoningText)
+      outputTokens: estimateTokens(rawContentText + reasoningText)
     });
   }
 
@@ -539,9 +552,8 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     reasoningText,
     toolCalls,
     inputTokens: estimateTokens(body),
-    outputTokens: estimateTokens(rawText + reasoningText)
+    outputTokens: estimateTokens(rawContentText + reasoningText)
   });
-
   return res.json(response);
 }
 

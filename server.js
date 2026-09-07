@@ -327,6 +327,15 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
   const tools = normalizeAnthropicTools(body.tools || []);
   const hostOrigin = originalTargetUrl.origin;
 
+  // 【核心新增 1】：创建下游与上游联动的 AbortController
+  const clientAbortController = new AbortController();
+  req.on("close", () => {
+    if (!res.writableEnded) {
+      log("warn", "client.disconnected", { hint: "CloudCLI 已断开连接，立即向终止上游请求" });
+      clientAbortController.abort();
+    }
+  });
+
   log("info", "request.in", {
     entry: "anthropic",
     model: body.model,
@@ -354,18 +363,15 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     renderedMessages.push({ role: "user", content: repeatWarning });
   }
 
-  // 构建下游流式桥接器
   const isClientStream = body.stream === true;
   const streamBridge = isClientStream
     ? new AnthropicStreamBridge(res, body.model, requestId, log)
     : null;
 
-  // 【核心修复】：只要是流式，立即响应下游 Claude Code 并开启 Thinking 状态
   if (streamBridge) {
     streamBridge.startThinkingEarly(estimateTokens(body));
   }
 
-  // 思考流回调：只要上游吐出思考增量，立即流式下发下游
   const onThinkingDelta = (chunk) => {
     if (streamBridge) streamBridge.emitThinkingDelta(chunk, estimateTokens(body));
   };
@@ -377,7 +383,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
 
   const cachedProtocol = endpointProtocolCache.get(hostOrigin);
 
-  // 1. 若支持 Anthropic，使用流式向 /v1/messages 发起请求
+  // 1. 若支持 Anthropic，使用流式发起请求
   if (cachedProtocol !== "openai") {
     try {
       log("info", "upstream.attempt", { mode: "anthropic_messages_stream", url: String(originalTargetUrl) });
@@ -400,15 +406,21 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
       });
 
       const probeTimeout = cachedProtocol === "anthropic" ? UPSTREAM_TIMEOUT_MS : 30000;
-      const upstreamResponse = await fetchUpstreamStreamWithRetry(requestId, originalTargetUrl, {
-        method: "POST",
-        headers: {
-          ...buildUpstreamHeaders(req),
-          "Content-Type": "application/json",
-          Accept: "text/event-stream, application/json"
+      const upstreamResponse = await fetchUpstreamStreamWithRetry(
+        requestId,
+        originalTargetUrl,
+        {
+          method: "POST",
+          headers: {
+            ...buildUpstreamHeaders(req),
+            "Content-Type": "application/json",
+            Accept: "text/event-stream, application/json"
+          },
+          body: JSON.stringify(anthropicBody),
+          signal: clientAbortController.signal // 传入客户端中断信号
         },
-        body: JSON.stringify(anthropicBody)
-      }, probeTimeout);
+        probeTimeout
+      );
 
       const result = await consumeAnthropicStream(upstreamResponse, onThinkingDelta);
       rawText = result.rawText;
@@ -416,19 +428,20 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
       success = true;
       endpointProtocolCache.set(hostOrigin, "anthropic");
     } catch (messagesError) {
+      if (clientAbortController.signal.aborted) return; // 客户端主动取消则直接返回
       if (messagesError?.status && messagesError.status !== 404) {
         throw messagesError;
       }
       log("warn", "upstream.messages_failed", {
         message: messagesError?.message || String(messagesError),
-        hint: "Anthropic /v1/messages 不可用，自动切换并记忆上游为 OpenAI /v1/chat/completions 接口"
+        hint: "切换上游为 OpenAI /v1/chat/completions 接口"
       });
       endpointProtocolCache.set(hostOrigin, "openai");
     }
   }
 
-  // 2. Fallback 到 OpenAI 接口，使用流式发起请求
-  if (!success) {
+  // 2. Fallback 到 OpenAI 接口
+  if (!success && !clientAbortController.signal.aborted) {
     log("info", "upstream.attempt", { mode: "openai_chat_fallback_stream" });
 
     const messages = [];
@@ -448,15 +461,20 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     });
 
     const upstreamUrl = rewriteAnthropicMessagesToOpenAI(originalTargetUrl);
-    const upstreamResponse = await fetchUpstreamStreamWithRetry(requestId, upstreamUrl, {
-      method: "POST",
-      headers: {
-        ...buildUpstreamHeaders(req),
-        "Content-Type": "application/json",
-        Accept: "text/event-stream, application/json"
-      },
-      body: JSON.stringify(openAIBody)
-    });
+    const upstreamResponse = await fetchUpstreamStreamWithRetry(
+      requestId,
+      upstreamUrl,
+      {
+        method: "POST",
+        headers: {
+          ...buildUpstreamHeaders(req),
+          "Content-Type": "application/json",
+          Accept: "text/event-stream, application/json"
+        },
+        body: JSON.stringify(openAIBody),
+        signal: clientAbortController.signal // 传入客户端中断信号
+      }
+    );
 
     const result = await consumeOpenAIStream(upstreamResponse, onThinkingDelta);
     rawText = result.rawText;
@@ -464,18 +482,21 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     nativeToolCalls = result.nativeToolCalls || [];
   }
 
-  // 流彻底结束，关闭下游思考块
+  if (clientAbortController.signal.aborted) return;
+
   if (streamBridge) streamBridge.finishThinking();
 
   // 兜底提取可能夹在正文中的<think>
-  const { text: splitCleanText, thinking } = adapt.splitThinking(rawText);
+    const { text: cleanText, thinking } = adapt.splitThinking(rawText);
   if (!reasoningText && thinking) reasoningText = thinking;
 
-  // 【核心修复】：容错处理缺失左括号的 "tool_call>"，补齐为 "<tool_call>"
-  let cleanText = splitCleanText.replace(/(^|\n)\s*tool_call>/g, "$1<tool_call>");
+  // 正文容错：如果模型输出了缺失尖括号的 tool_call>，自动补齐
+  let sanitizedText = cleanText;
+  if (sanitizedText.includes("tool_call>") && !sanitizedText.includes("<tool_call>")) {
+    sanitizedText = sanitizedText.replace(/(?<!<)tool_call>/g, "<tool_call>");
+  }
 
-  // 正文缓冲提取工具调用
-  const extracted = adapt.extractToolCalls(cleanText, tools, tuning, log, () =>
+  const extracted = adapt.extractToolCalls(sanitizedText, tools, tuning, log, () =>
     `toolu_${uuid()}`
   );
 
@@ -503,7 +524,6 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     rejectedCandidates: extracted.rejected.length
   });
 
-  // 流式收尾
   if (streamBridge) {
     return streamBridge.finishWithPayload({
       text,
@@ -513,7 +533,6 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     });
   }
 
-  // 非流式响应
   const response = buildAnthropicResponse({
     requestModel: body.model,
     text,
@@ -1819,18 +1838,25 @@ async function safeFetch(initialUrl, options, timeoutMs = UPSTREAM_TIMEOUT_MS) {
     for (let attempt = 1; attempt <= CONNECT_MAX_ATTEMPTS; attempt++) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
-
+      
+      // 如果调用者传了 options.signal（即客户端中断），任一触发即 abort
+      const onCallerAbort = () => controller.abort();
+      if (options?.signal) {
+        options.signal.addEventListener("abort", onCallerAbort, { once: true });
+      }
+      
       try {
         response = await fetch(current, {
           ...options,
           redirect: "manual",
           signal: controller.signal
         });
-
         clearTimeout(timer);
+        if (options?.signal) options.signal.removeEventListener("abort", onCallerAbort);
         break;
       } catch (error) {
         clearTimeout(timer);
+        if (options?.signal) options.signal.removeEventListener("abort", onCallerAbort);
         lastError = error;
 
         if (error?.name === "AbortError") {

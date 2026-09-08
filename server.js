@@ -440,18 +440,16 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
         if (!inThinkTag) {
           const thinkStartIdx = contentChunk.indexOf("");
           if (thinkStartIdx !== -1) {
-            //  之前的是普通正文
             const beforePiece = contentChunk.slice(0, thinkStartIdx);
             rawContentText += beforePiece;
 
             inThinkTag = true;
-            contentChunk = contentChunk.slice(thinkStartIdx + 7); // 剥离 ""
+            contentChunk = contentChunk.slice(thinkStartIdx + 7);
           } else {
             rawContentText += contentChunk;
             contentChunk = "";
           }
         } else {
-          // 当前正处于  思考中
           const thinkEndIdx = contentChunk.indexOf("<think>");
           if (thinkEndIdx !== -1) {
             const thinkPiece = contentChunk.slice(0, thinkEndIdx);
@@ -460,9 +458,8 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
               streamBridge.emitThinkingDelta(thinkPiece, estimateTokens(body));
             }
             inThinkTag = false;
-            contentChunk = contentChunk.slice(thinkEndIdx + 8); // 剥离 "</think>"
+            contentChunk = contentChunk.slice(thinkEndIdx + 8);
           } else {
-            // 全块都属于思考内容，实时流式发射给 Claude Code
             reasoningText += contentChunk;
             if (streamBridge) {
               streamBridge.emitThinkingDelta(contentChunk, estimateTokens(body));
@@ -519,9 +516,59 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     tools,
     tuning
   );
-  const toolCalls = mergeToolCalls([nativeExtracted, extracted.toolCalls], tuning);
+
+  let mergedCalls = mergeToolCalls([nativeExtracted, extracted.toolCalls], tuning);
+  let cleanContent = extracted.content;
+
+  // 【新增】：兜底识别模型直接输出裸 JSON（未声明工具名称）的情况
+  if (mergedCalls.length === 0 && cleanContent) {
+    const jsonMatch = cleanContent.match(/\{[\s\S]*\}$/);
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          // 根据参数键匹配对应工具名
+          let inferredToolName = null;
+          const paramKeys = Object.keys(parsed);
+
+          if (parsed.command) {
+            inferredToolName = "Bash";
+          } else {
+            // 在可用 tools 中寻找参数重合度最高的工具
+            for (const tool of tools) {
+              const properties = Object.keys(tool.parameters?.properties || {});
+              if (properties.length > 0 && paramKeys.some((k) => properties.includes(k))) {
+                inferredToolName = tool.name;
+                break;
+              }
+            }
+          }
+
+          if (inferredToolName) {
+            mergedCalls = [
+              {
+                id: `toolu_${uuid()}`,
+                name: inferredToolName,
+                arguments: parsed
+              }
+            ];
+            // 从正文中剔除裸露的 JSON 块，还原自然文本
+            cleanContent = cleanContent.slice(0, jsonMatch.index).trim();
+            log("info", "tool_call.inferred_from_bare_json", {
+              inferredToolName,
+              arguments: parsed
+            });
+          }
+        }
+      } catch {
+        /* 不是合法 JSON 则保留原文本 */
+      }
+    }
+  }
+
+  const toolCalls = mergedCalls;
   const text = ensureVisibleAssistantText(
-    extracted.content,
+    cleanContent,
     toolCalls,
     "上游模型返回了空内容，未生成可执行的工具调用。"
   );

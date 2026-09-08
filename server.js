@@ -701,7 +701,10 @@ class AnthropicStreamBridge {
     this.thinkingEnded = false;
     this.currentIndex = 0;
 
-    // 【核心修复】：向下游 Claude Code 持续发送心跳，防止任何网络节点超时断开
+    // 【修复】：连接建立瞬间立刻初始化 SSE 头部，通知网关这是持久流
+    setupSSE(this.res);
+    this.ensureStarted(0);
+
     this.keepAliveTimer = setInterval(() => {
       try {
         if (!this.res.writableEnded) {

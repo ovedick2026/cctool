@@ -485,46 +485,249 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
   let mergedCalls = mergeToolCalls([nativeExtracted, extracted.toolCalls], tuning);
   let cleanContent = extracted.content;
 
-  // 兜底识别模型直接输出裸 JSON（未声明工具名称）的情况
+  // 兜底识别上游模型直接在文本中输出的 JSON / Python 字典 / 裸参数工具调用
   if (mergedCalls.length === 0 && cleanContent) {
-    const jsonMatch = cleanContent.match(/\{[\s\S]*\}$/);
-    if (jsonMatch) {
-      try {
-        const parsed = JSON.parse(jsonMatch[0]);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          let inferredToolName = null;
-          const paramKeys = Object.keys(parsed);
+    // 安全解析 Python 字典字面量及标准 JSON（支持 True/False/None、单双引号与复杂转义）
+    const parsePythonOrJson = (str) => {
+      let i = 0;
+      const len = str.length;
+      const skipWs = () => { while (i < len && /\s/.test(str[i])) i++; };
 
-          if (parsed.command) {
-            inferredToolName = "Bash";
-          } else {
-            for (const tool of tools) {
-              const properties = Object.keys(tool.parameters?.properties || {});
-              if (properties.length > 0 && paramKeys.some((k) => properties.includes(k))) {
-                inferredToolName = tool.name;
-                break;
+      const parseVal = () => {
+        skipWs();
+        if (i >= len) throw new Error("Unexpected end");
+        const ch = str[i];
+        if (ch === "{") return parseObj();
+        if (ch === "[") return parseArr();
+        if (ch === '"' || ch === "'") return parseStr();
+        if (ch === "-" || (ch >= "0" && ch <= "9")) return parseNum();
+
+        const match = str.slice(i).match(/^[A-Za-z_][A-Za-z0-9_]*/);
+        if (match) {
+          const ident = match[0];
+          i += ident.length;
+          if (ident === "True" || ident === "true") return true;
+          if (ident === "False" || ident === "false") return false;
+          if (ident === "None" || ident === "null") return null;
+          throw new Error(`Unknown identifier: ${ident}`);
+        }
+        throw new Error(`Unexpected character: ${ch}`);
+      };
+
+      const parseStr = () => {
+        const quote = str[i++];
+        let res = "";
+        while (i < len) {
+          const ch = str[i++];
+          if (ch === quote) return res;
+          if (ch === "\\") {
+            if (i >= len) break;
+            const esc = str[i++];
+            if (esc === "n") res += "\n";
+            else if (esc === "r") res += "\r";
+            else if (esc === "t") res += "\t";
+            else if (esc === "b") res += "\b";
+            else if (esc === "f") res += "\f";
+            else if (esc === quote) res += quote;
+            else if (esc === "\\") res += "\\";
+            else if (esc === "u") {
+              const hex = str.slice(i, i + 4);
+              if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+                res += String.fromCharCode(parseInt(hex, 16));
+                i += 4;
+              } else {
+                res += "\\u";
               }
+            } else {
+              res += esc;
+            }
+          } else {
+            res += ch;
+          }
+        }
+        return res;
+      };
+
+      const parseNum = () => {
+        const start = i;
+        if (str[i] === "-") i++;
+        while (i < len && str[i] >= "0" && str[i] <= "9") i++;
+        if (i < len && str[i] === ".") {
+          i++;
+          while (i < len && str[i] >= "0" && str[i] <= "9") i++;
+        }
+        if (i < len && (str[i] === "e" || str[i] === "E")) {
+          i++;
+          if (i < len && (str[i] === "+" || str[i] === "-")) i++;
+          while (i < len && str[i] >= "0" && str[i] <= "9") i++;
+        }
+        const num = Number(str.slice(start, i));
+        if (Number.isNaN(num)) throw new Error("Invalid number");
+        return num;
+      };
+
+      const parseObj = () => {
+        i++; // skip '{'
+        const obj = {};
+        skipWs();
+        if (i < len && str[i] === "}") { i++; return obj; }
+        while (i < len) {
+          skipWs();
+          let key = "";
+          if (str[i] === '"' || str[i] === "'") {
+            key = parseStr();
+          } else {
+            const km = str.slice(i).match(/^[A-Za-z_][A-Za-z0-9_]*/);
+            if (!km) throw new Error("Invalid key");
+            key = km[0];
+            i += key.length;
+          }
+          skipWs();
+          if (i >= len || str[i] !== ":") throw new Error("Missing ':'");
+          i++;
+          obj[key] = parseVal();
+          skipWs();
+          if (i < len && str[i] === ",") {
+            i++;
+            skipWs();
+            if (i < len && str[i] === "}") { i++; return obj; }
+          } else if (i < len && str[i] === "}") {
+            i++;
+            return obj;
+          } else {
+            throw new Error("Expected ',' or '}'");
+          }
+        }
+        return obj;
+      };
+
+      const parseArr = () => {
+        i++; // skip '['
+        const arr = [];
+        skipWs();
+        if (i < len && str[i] === "]") { i++; return arr; }
+        while (i < len) {
+          arr.push(parseVal());
+          skipWs();
+          if (i < len && str[i] === ",") {
+            i++;
+            skipWs();
+            if (i < len && str[i] === "]") { i++; return arr; }
+          } else if (i < len && str[i] === "]") {
+            i++;
+            return arr;
+          } else {
+            throw new Error("Expected ',' or ']'");
+          }
+        }
+        return arr;
+      };
+
+      skipWs();
+      const value = parseVal();
+      return { value, endIndex: i };
+    };
+
+    // 收集所有可能是对象的起始 '{' 索引
+    const candidateStarts = [];
+    for (let pos = 0; pos < cleanContent.length; pos++) {
+      if (cleanContent[pos] === "{") candidateStarts.push(pos);
+    }
+
+    let recoveredCall = null;
+    let recoveredStartIndex = -1;
+
+    // 第一阶段：优先寻找显式声明了工具名或 tool_use 类型的对象（避免被内层嵌套参数或前文普通 JSON 误导）
+    for (let idx = candidateStarts.length - 1; idx >= 0; idx--) {
+      const startPos = candidateStarts[idx];
+      try {
+        const { value: parsed } = parsePythonOrJson(cleanContent.slice(startPos));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          let callName = null;
+          let callArgs = null;
+          const callId = parsed.id || null;
+
+          // 场景 1: Anthropic 原生格式 {"type":"tool_use","id":"...","name":"Edit","input":{...}}
+          if (parsed.type === "tool_use" || (parsed.name && parsed.input !== undefined)) {
+            callName = parsed.name;
+            callArgs = parsed.input;
+          }
+          // 场景 2: OpenAI / Python 格式 {'name': 'Edit', 'arguments': {...}}
+          else if (parsed.name && (parsed.arguments !== undefined || parsed.parameters !== undefined)) {
+            callName = parsed.name;
+            callArgs = parsed.arguments !== undefined ? parsed.arguments : parsed.parameters;
+            if (typeof callArgs === "string") {
+              try { callArgs = parsePythonOrJson(callArgs).value; } catch {}
+            }
+          }
+          // 场景 3: 包含 name 且在合法工具列表中，其它字段即是参数
+          else if (parsed.name) {
+            const resolved = adapt.resolveToolName?.(parsed.name, tools) || parsed.name;
+            const matchedTool = adapt.getToolByName?.(resolved, tools) ||
+              tools.find((t) => t.name.toLowerCase() === String(parsed.name).toLowerCase());
+            if (matchedTool) {
+              callName = matchedTool.name;
+              const { name: _n, id: _id, type: _t, ...rest } = parsed;
+              callArgs = rest;
             }
           }
 
-          if (inferredToolName) {
-            mergedCalls = [
-              {
-                id: `toolu_${uuid()}`,
-                name: inferredToolName,
-                arguments: parsed
-              }
-            ];
-            cleanContent = cleanContent.slice(0, jsonMatch.index).trim();
-            log("info", "tool_call.inferred_from_bare_json", {
-              inferredToolName,
-              arguments: parsed
-            });
+          if (callName && callArgs && typeof callArgs === "object" && !Array.isArray(callArgs)) {
+            recoveredCall = {
+              id: callId || `toolu_${uuid()}`,
+              name: callName,
+              arguments: adapt.sanitizeToolArguments ? adapt.sanitizeToolArguments(callArgs) : callArgs
+            };
+            recoveredStartIndex = startPos;
+            break;
           }
         }
-      } catch {
-        /* 不是合法 JSON 则保留原文本 */
+      } catch {}
+    }
+
+    // 第二阶段：未找到显式声明时，回退至原有裸 JSON 参数推断（通过 command 或 tools 字段特征）
+    if (!recoveredCall) {
+      for (let idx = candidateStarts.length - 1; idx >= 0; idx--) {
+        const startPos = candidateStarts[idx];
+        try {
+          const { value: parsed } = parsePythonOrJson(cleanContent.slice(startPos));
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            let inferredToolName = null;
+            const paramKeys = Object.keys(parsed);
+
+            if (parsed.command) {
+              inferredToolName = "Bash";
+            } else {
+              for (const tool of tools) {
+                const properties = Object.keys(tool.parameters?.properties || {});
+                if (properties.length > 0 && paramKeys.some((k) => properties.includes(k))) {
+                  inferredToolName = tool.name;
+                  break;
+                }
+              }
+            }
+
+            if (inferredToolName) {
+              recoveredCall = {
+                id: `toolu_${uuid()}`,
+                name: inferredToolName,
+                arguments: adapt.sanitizeToolArguments ? adapt.sanitizeToolArguments(parsed) : parsed
+              };
+              recoveredStartIndex = startPos;
+              break;
+            }
+          }
+        } catch {}
       }
+    }
+
+    if (recoveredCall) {
+      mergedCalls = [recoveredCall];
+      cleanContent = cleanContent.slice(0, recoveredStartIndex).replace(/```[a-zA-Z0-9_-]*\s*$/, "").trim();
+      log("info", "tool_call.recovered_from_text", {
+        toolName: recoveredCall.name,
+        arguments: recoveredCall.arguments
+      });
     }
   }
 

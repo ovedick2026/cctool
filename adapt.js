@@ -156,7 +156,7 @@ export function getPreset(id) {
 export const DEFAULT_TUNING = {
   // ---- 上下文压缩 -------------------------------------------------------
   /** 最近 N 条消息原样保留、绝不压缩。太小会让模型忘记刚做过什么。 */
-  keepRecentMessages: 15,
+  keepRecentMessages: 12,
   /** 历史里 tool_result（文件内容、命令输出）正文的字符上限。 */
   toolResultMaxChars: 8000,
   /** 历史里普通文本消息的字符上限。 */

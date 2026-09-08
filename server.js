@@ -321,52 +321,6 @@ app.use(async (req, res) => {
 /* -------------------------------------------------------------------------- */
 
 async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
-  const log = logBus.scoped(requestId);
-  const body = req.body || {};
-  const tuning = runtimeConfig.tuning;
-  const tools = normalizeAnthropicTools(body.tools || []);
-
-  // 客户端断开连接联动
-  const clientAbortController = new AbortController();
-  req.on("close", () => {
-    if (!res.writableEnded) {
-      log("warn", "client.disconnected", { hint: "下游连接断开，终止上游请求" });
-      clientAbortController.abort();
-    }
-  });
-
-  log("info", "request.in", {
-    entry: "anthropic",
-    model: body.model,
-    mappedModel: resolveModel(body.model),
-    stream: body.stream === true,
-    messageCount: (body.messages || []).length,
-    toolCount: tools.length,
-    toolNames: tools.map((tool) => tool.name),
-    toolChoice: body.tool_choice,
-    estimatedInputTokens: estimateTokens(body)
-  });
-
-  const conversation = anthropicToConversation(body);
-  const compressed = adapt.compressHistory(conversation, tuning, log);
-  const renderedMessages = adapt.renderConversation(compressed, tuning, log);
-  const toolPrompt = adapt.renderToolPrompt(tools, body.tool_choice, {
-    promptText: currentPromptText(),
-    tuning
-  });
-
-  const repeatWarning = adapt.detectRepeatedToolCall(compressed, tuning);
-  if (repeatWarning) {
-    log("warn", "loop.repeat_detected", { injected: repeatWarning });
-    renderedMessages.push({ role: "user", content: repeatWarning });
-  }
-
-  const isClientStream = body.stream === true;
-  const streamBridge = isClientStream
-    ? new AnthropicStreamBridge(res, body.model, requestId, log)
-    : null;
-
-  // 1. 组装 OpenAI 格式请求报文（统一直接走 /v1/chat/completions）
   const messages = [];
   if (runtimeConfig.includeOriginalSystem && compressed.system) {
     messages.push({ role: "system", content: compressed.system });
@@ -374,12 +328,21 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
   if (toolPrompt) messages.push({ role: "system", content: toolPrompt });
   messages.push(...renderedMessages);
 
+  // 【核心修复】：严防 adapt 注入过激停用词（如反引号、换行等误杀工具块）
+  // 仅当下游显式传了 stop_sequences 时才透传，不给模型额外加枷锁
+  const safeStop = orUndefined(
+    Array.isArray(body.stop_sequences) && body.stop_sequences.length
+      ? body.stop_sequences
+      : undefined
+  );
+
   const openAIBody = cleanUndefined({
     model: resolveModel(body.model),
     messages,
     temperature: body.temperature,
     top_p: body.top_p,
-    stop: orUndefined(adapt.buildStopSequences(body.stop_sequences || body.stop, tools, tuning)),
+    stop: safeStop,
+    max_tokens: Math.max(Number(body.max_tokens) || 0, 8192), // 确保思考后仍有充足 token 吐工具
     stream: true
   });
 
@@ -408,6 +371,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
   let reasoningText = "";
   const nativeToolCallMap = new Map();
   let inThinkTag = false;
+  let upstreamFinishReason = null;
 
   for await (const { data } of readSSE(upstreamResponse)) {
     if (clientAbortController.signal.aborted) return;
@@ -422,6 +386,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     }
 
     const choice = payload.choices?.[0];
+    if (choice?.finish_reason) upstreamFinishReason = choice.finish_reason;
     const delta = choice?.delta;
     if (!delta) continue;
 
@@ -432,7 +397,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
       if (streamBridge) streamBridge.emitThinkingDelta(thinkingChunk, estimateTokens(body));
     }
 
-    // B. 处理正文 delta.content，同时兼顾模型自行输出的 <think> 标签
+    // B. 处理正文 delta.content，同时兼顾模型自行输出的<think>标签
     if (delta.content) {
       let contentChunk = delta.content;
 
@@ -520,21 +485,19 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
   let mergedCalls = mergeToolCalls([nativeExtracted, extracted.toolCalls], tuning);
   let cleanContent = extracted.content;
 
-  // 【新增】：兜底识别模型直接输出裸 JSON（未声明工具名称）的情况
+  // 兜底识别模型直接输出裸 JSON（未声明工具名称）的情况
   if (mergedCalls.length === 0 && cleanContent) {
     const jsonMatch = cleanContent.match(/\{[\s\S]*\}$/);
     if (jsonMatch) {
       try {
         const parsed = JSON.parse(jsonMatch[0]);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          // 根据参数键匹配对应工具名
           let inferredToolName = null;
           const paramKeys = Object.keys(parsed);
 
           if (parsed.command) {
             inferredToolName = "Bash";
           } else {
-            // 在可用 tools 中寻找参数重合度最高的工具
             for (const tool of tools) {
               const properties = Object.keys(tool.parameters?.properties || {});
               if (properties.length > 0 && paramKeys.some((k) => properties.includes(k))) {
@@ -552,7 +515,6 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
                 arguments: parsed
               }
             ];
-            // 从正文中剔除裸露的 JSON 块，还原自然文本
             cleanContent = cleanContent.slice(0, jsonMatch.index).trim();
             log("info", "tool_call.inferred_from_bare_json", {
               inferredToolName,
@@ -574,6 +536,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
   );
 
   log("info", "response.out", {
+    finishReason: upstreamFinishReason,
     toolCalls: toolCalls.map((call) => ({
       name: call.name,
       args: Object.keys(call.arguments || {})

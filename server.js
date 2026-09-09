@@ -275,7 +275,7 @@ app.use(async (req, res) => {
     }
 
     if (req.method === "POST" && (pathname.endsWith("/v1/messages") || pathname.endsWith("/v1/message"))) {
-      return await (req, res, requestId, targetUrl);
+      return await handleAnthropicMessages(req, res, requestId, targetUrl);
     }
 
     if (req.method === "POST" && pathname.endsWith("/v1/chat/completions")) {

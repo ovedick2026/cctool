@@ -482,16 +482,20 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     tuning
   );
 
-    let mergedCalls = mergeToolCalls([nativeExtracted, extracted.toolCalls], tuning);
+  let mergedCalls = mergeToolCalls([nativeExtracted, extracted.toolCalls], tuning);
   let cleanContent = extracted.content;
 
   // 兜底识别上游模型直接在文本中输出的 JSON / Python 字典 / 裸参数工具调用
-  // 【修复】：使用 sanitizedText 作为检索源，避免工具块已被 adapt.extractToolCalls 从 cleanContent 中剔除
   const textToSearch = sanitizedText || cleanContent;
 
   if (mergedCalls.length === 0 && textToSearch) {
-    // 安全解析 Python 字典字面量及标准 JSON（支持 True/False/None、单双引号与复杂转义，支持 EOF 容错自动闭合）
-    const parsePythonOrJson = (str) => {
+    // 1. 安全解析标准 JSON 或 Python 字典（支持单双引号、True/False/None 及未闭合容错）
+    const parseLooseJsonOrPython = (str) => {
+      // 优先尝试原生 JSON.parse
+      try {
+        return { value: JSON.parse(str), endIndex: str.length };
+      } catch {}
+
       let i = 0;
       const len = str.length;
       const skipWs = () => { while (i < len && /\s/.test(str[i])) i++; };
@@ -512,7 +516,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
           if (ident === "True" || ident === "true") return true;
           if (ident === "False" || ident === "false") return false;
           if (ident === "None" || ident === "null") return null;
-          throw new Error(`Unknown identifier: ${ident}`);
+          return ident;
         }
         throw new Error(`Unexpected character: ${ch}`);
       };
@@ -548,7 +552,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
             res += ch;
           }
         }
-        return res; // 【容错】：EOF 未闭合引号时返回已读内容
+        return res;
       };
 
       const parseNum = () => {
@@ -564,9 +568,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
           if (i < len && (str[i] === "+" || str[i] === "-")) i++;
           while (i < len && str[i] >= "0" && str[i] <= "9") i++;
         }
-        const num = Number(str.slice(start, i));
-        if (Number.isNaN(num)) throw new Error("Invalid number");
-        return num;
+        return Number(str.slice(start, i));
       };
 
       const parseObj = () => {
@@ -599,7 +601,6 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
             i++;
             return obj;
           } else if (i >= len) {
-            // 【核心修复】：上游模型遗漏外层 '}' 到达 EOF 时，自动闭合对象并返回
             return obj;
           } else {
             break;
@@ -623,7 +624,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
             if (i < len && str[i] === "]") { i++; return arr; }
           } else if (i < len && str[i] === "]") {
             i++;
-            return obj;
+            return arr; // 【修复原代码致命 Bug: 原为 return obj 抛错】
           } else if (i >= len) {
             return arr;
           } else {
@@ -639,103 +640,171 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
       return { value, endIndex: i };
     };
 
-    // 收集所有可能是对象的起始 '{' 索引
-    const candidateStarts = [];
-    for (let pos = 0; pos < textToSearch.length; pos++) {
-      if (textToSearch[pos] === "{") candidateStarts.push(pos);
+    // 2. 提取并平衡括号对象的切片
+    const extractBalancedObjectString = (text, startIdx) => {
+      let depth = 0;
+      let inString = false;
+      let quoteChar = "";
+      let escape = false;
+
+      for (let pos = startIdx; pos < text.length; pos++) {
+        const ch = text[pos];
+
+        if (inString) {
+          if (escape) {
+            escape = false;
+          } else if (ch === "\\") {
+            escape = true;
+          } else if (ch === quoteChar) {
+            inString = false;
+          }
+          continue;
+        }
+
+        if (ch === '"' || ch === "'") {
+          inString = true;
+          quoteChar = ch;
+        } else if (ch === "{") {
+          depth++;
+        } else if (ch === "}") {
+          depth--;
+          if (depth === 0) {
+            return text.slice(startIdx, pos + 1);
+          }
+        }
+      }
+      return text.slice(startIdx); // 未完全闭合时截取至 EOF
+    };
+
+    // 3. 收集所有可能的工具调用起始点（优先正则锚定显式结构，杜绝被大段代码干扰）
+    const explicitPattern = /\{\s*["'](?:name|type|function|tool|action)["']\s*:/g;
+    const candidateIndices = [];
+    let match;
+    while ((match = explicitPattern.exec(textToSearch)) !== null) {
+      candidateIndices.push(match.index);
+    }
+
+    // 若未通过正则找到显式键，再兜底扫描开头的每一个 '{'
+    if (candidateIndices.length === 0) {
+      for (let pos = 0; pos < textToSearch.length; pos++) {
+        if (textToSearch[pos] === "{") candidateIndices.push(pos);
+      }
     }
 
     let recoveredCall = null;
     let recoveredStartIndex = -1;
 
-    // 第一阶段：优先寻找显式声明了工具名或 tool_use 类型的对象
-    for (let idx = candidateStarts.length - 1; idx >= 0; idx--) {
-      const startPos = candidateStarts[idx];
+    // 4. 解析与识别
+    for (const startPos of candidateIndices) {
+      const candidateStr = extractBalancedObjectString(textToSearch, startPos);
+      let parsed = null;
+
       try {
-        const { value: parsed } = parsePythonOrJson(textToSearch.slice(startPos));
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          let callName = null;
-          let callArgs = null;
-          const callId = parsed.id || null;
+        parsed = JSON.parse(candidateStr);
+      } catch {
+        try {
+          const res = parseLooseJsonOrPython(candidateStr);
+          parsed = res?.value;
+        } catch {}
+      }
 
-          // 场景 1: Anthropic 原生格式 {"type":"tool_use","id":"...","name":"Edit","input":{...}}
-          if (parsed.type === "tool_use" || (parsed.name && parsed.input !== undefined)) {
-            callName = parsed.name;
-            callArgs = parsed.input;
-          }
-          // 场景 2: OpenAI / Python 格式 {'name': 'Edit', 'arguments': {...}}
-          else if (parsed.name && (parsed.arguments !== undefined || parsed.parameters !== undefined)) {
-            callName = parsed.name;
-            callArgs = parsed.arguments !== undefined ? parsed.arguments : parsed.parameters;
-            if (typeof callArgs === "string") {
-              try { callArgs = parsePythonOrJson(callArgs).value; } catch {}
-            }
-          }
-          // 场景 3: 包含 name 且在合法工具列表中，其它字段即是参数
-          else if (parsed.name) {
-            const resolved = adapt.resolveToolName?.(parsed.name, tools) || parsed.name;
-            const matchedTool = adapt.getToolByName?.(resolved, tools) ||
-              tools.find((t) => t.name.toLowerCase() === String(parsed.name).toLowerCase());
-            if (matchedTool) {
-              callName = matchedTool.name;
-              const { name: _n, id: _id, type: _t, ...rest } = parsed;
-              callArgs = rest;
-            }
-          }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
 
-          if (callName) {
-            const resolved = adapt.resolveToolName?.(callName, tools) || callName;
-            const matchedTool = adapt.getToolByName?.(resolved, tools) ||
-              tools.find((t) => t.name.toLowerCase() === String(callName).toLowerCase());
-            if (matchedTool) callName = matchedTool.name;
-          }
+      let callName = null;
+      let callArgs = null;
+      const callId = parsed.id || null;
 
-          if (callName && callArgs && typeof callArgs === "object" && !Array.isArray(callArgs)) {
-            recoveredCall = {
-              id: callId || `toolu_${uuid()}`,
-              name: callName,
-              arguments: adapt.sanitizeToolArguments ? adapt.sanitizeToolArguments(callArgs) : callArgs
-            };
-            recoveredStartIndex = startPos;
-            break;
-          }
+      // 模式 1: Anthropic 格式 {"type":"tool_use","name":"Write","input":{...}}
+      if (parsed.type === "tool_use" || (parsed.name && parsed.input !== undefined)) {
+        callName = parsed.name;
+        callArgs = parsed.input;
+      }
+      // 模式 2: OpenAI / Python 格式 {"name":"Write","arguments":{...}}
+      else if (parsed.name && (parsed.arguments !== undefined || parsed.parameters !== undefined)) {
+        callName = parsed.name;
+        callArgs = parsed.arguments !== undefined ? parsed.arguments : parsed.parameters;
+      }
+      // 模式 3: 包含 name 字段且 name 对应某个工具
+      else if (parsed.name) {
+        const resolved = adapt.resolveToolName?.(parsed.name, tools) || parsed.name;
+        const matchedTool = adapt.getToolByName?.(resolved, tools) ||
+          tools.find((t) => t.name.toLowerCase() === String(parsed.name).toLowerCase());
+        if (matchedTool) {
+          callName = matchedTool.name;
+          const { name: _n, id: _id, type: _t, ...rest } = parsed;
+          callArgs = rest;
         }
-      } catch {}
+      }
+
+      // 如果 arguments 是序列化的 JSON 字符串，反序列化
+      if (typeof callArgs === "string") {
+        try {
+          callArgs = JSON.parse(callArgs);
+        } catch {
+          try {
+            callArgs = parseLooseJsonOrPython(callArgs).value;
+          } catch {}
+        }
+      }
+
+      // 规范化工具名
+      if (callName) {
+        const resolved = adapt.resolveToolName?.(callName, tools) || callName;
+        const matchedTool = adapt.getToolByName?.(resolved, tools) ||
+          tools.find((t) => t.name.toLowerCase() === String(callName).toLowerCase());
+        if (matchedTool) callName = matchedTool.name;
+      }
+
+      if (callName && callArgs && typeof callArgs === "object" && !Array.isArray(callArgs)) {
+        recoveredCall = {
+          id: callId || `toolu_${uuid()}`,
+          name: callName,
+          arguments: adapt.sanitizeToolArguments ? adapt.sanitizeToolArguments(callArgs) : callArgs
+        };
+        recoveredStartIndex = startPos;
+        break;
+      }
     }
 
-    // 第二阶段：未找到显式声明时，回退至原有裸 JSON 参数推断
+    // 5. 兜底未声明 tool name 的纯参数对象推断 (如只输出了 {"file_path": "...", "content": "..."})
     if (!recoveredCall) {
-      for (let idx = candidateStarts.length - 1; idx >= 0; idx--) {
-        const startPos = candidateStarts[idx];
+      for (const startPos of candidateIndices) {
+        const candidateStr = extractBalancedObjectString(textToSearch, startPos);
+        let parsed = null;
         try {
-          const { value: parsed } = parsePythonOrJson(textToSearch.slice(startPos));
-          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            let inferredToolName = null;
-            const paramKeys = Object.keys(parsed);
+          parsed = JSON.parse(candidateStr);
+        } catch {
+          try { parsed = parseLooseJsonOrPython(candidateStr)?.value; } catch {}
+        }
 
-            if (parsed.command) {
-              inferredToolName = "Bash";
-            } else {
-              for (const tool of tools) {
-                const properties = Object.keys(tool.parameters?.properties || {});
-                if (properties.length > 0 && paramKeys.some((k) => properties.includes(k))) {
-                  inferredToolName = tool.name;
-                  break;
-                }
-              }
-            }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
 
-            if (inferredToolName) {
-              recoveredCall = {
-                id: `toolu_${uuid()}`,
-                name: inferredToolName,
-                arguments: adapt.sanitizeToolArguments ? adapt.sanitizeToolArguments(parsed) : parsed
-              };
-              recoveredStartIndex = startPos;
+        let inferredToolName = null;
+        const paramKeys = Object.keys(parsed);
+
+        if (parsed.command) {
+          inferredToolName = "Bash";
+        } else if (parsed.file_path && parsed.content !== undefined) {
+          inferredToolName = "Write";
+        } else {
+          for (const tool of tools) {
+            const properties = Object.keys(tool.parameters?.properties || {});
+            if (properties.length > 0 && paramKeys.some((k) => properties.includes(k))) {
+              inferredToolName = tool.name;
               break;
             }
           }
-        } catch {}
+        }
+
+        if (inferredToolName) {
+          recoveredCall = {
+            id: `toolu_${uuid()}`,
+            name: inferredToolName,
+            arguments: adapt.sanitizeToolArguments ? adapt.sanitizeToolArguments(parsed) : parsed
+          };
+          recoveredStartIndex = startPos;
+          break;
+        }
       }
     }
 
@@ -747,7 +816,6 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
         arguments: recoveredCall.arguments
       });
     } else if (sanitizedText && sanitizedText.length > cleanContent.length) {
-      // 兜底容错：如果未识别出任何工具，将 cleanContent 还原为完整正文，防止误截断
       cleanContent = sanitizedText;
     }
   }

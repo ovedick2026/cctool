@@ -482,12 +482,15 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
     tuning
   );
 
-  let mergedCalls = mergeToolCalls([nativeExtracted, extracted.toolCalls], tuning);
+    let mergedCalls = mergeToolCalls([nativeExtracted, extracted.toolCalls], tuning);
   let cleanContent = extracted.content;
 
   // 兜底识别上游模型直接在文本中输出的 JSON / Python 字典 / 裸参数工具调用
-  if (mergedCalls.length === 0 && cleanContent) {
-    // 安全解析 Python 字典字面量及标准 JSON（支持 True/False/None、单双引号与复杂转义）
+  // 【修复】：使用 sanitizedText 作为检索源，避免工具块已被 adapt.extractToolCalls 从 cleanContent 中剔除
+  const textToSearch = sanitizedText || cleanContent;
+
+  if (mergedCalls.length === 0 && textToSearch) {
+    // 安全解析 Python 字典字面量及标准 JSON（支持 True/False/None、单双引号与复杂转义，支持 EOF 容错自动闭合）
     const parsePythonOrJson = (str) => {
       let i = 0;
       const len = str.length;
@@ -495,7 +498,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
 
       const parseVal = () => {
         skipWs();
-        if (i >= len) throw new Error("Unexpected end");
+        if (i >= len) return null;
         const ch = str[i];
         if (ch === "{") return parseObj();
         if (ch === "[") return parseArr();
@@ -545,7 +548,7 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
             res += ch;
           }
         }
-        return res;
+        return res; // 【容错】：EOF 未闭合引号时返回已读内容
       };
 
       const parseNum = () => {
@@ -573,17 +576,18 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
         if (i < len && str[i] === "}") { i++; return obj; }
         while (i < len) {
           skipWs();
+          if (i >= len || str[i] === "}") break;
           let key = "";
           if (str[i] === '"' || str[i] === "'") {
             key = parseStr();
           } else {
             const km = str.slice(i).match(/^[A-Za-z_][A-Za-z0-9_]*/);
-            if (!km) throw new Error("Invalid key");
+            if (!km) break;
             key = km[0];
             i += key.length;
           }
           skipWs();
-          if (i >= len || str[i] !== ":") throw new Error("Missing ':'");
+          if (i >= len || str[i] !== ":") break;
           i++;
           obj[key] = parseVal();
           skipWs();
@@ -594,10 +598,14 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
           } else if (i < len && str[i] === "}") {
             i++;
             return obj;
+          } else if (i >= len) {
+            // 【核心修复】：上游模型遗漏外层 '}' 到达 EOF 时，自动闭合对象并返回
+            return obj;
           } else {
-            throw new Error("Expected ',' or '}'");
+            break;
           }
         }
+        if (i < len && str[i] === "}") i++;
         return obj;
       };
 
@@ -615,11 +623,14 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
             if (i < len && str[i] === "]") { i++; return arr; }
           } else if (i < len && str[i] === "]") {
             i++;
+            return obj;
+          } else if (i >= len) {
             return arr;
           } else {
-            throw new Error("Expected ',' or ']'");
+            break;
           }
         }
+        if (i < len && str[i] === "]") i++;
         return arr;
       };
 
@@ -630,18 +641,18 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
 
     // 收集所有可能是对象的起始 '{' 索引
     const candidateStarts = [];
-    for (let pos = 0; pos < cleanContent.length; pos++) {
-      if (cleanContent[pos] === "{") candidateStarts.push(pos);
+    for (let pos = 0; pos < textToSearch.length; pos++) {
+      if (textToSearch[pos] === "{") candidateStarts.push(pos);
     }
 
     let recoveredCall = null;
     let recoveredStartIndex = -1;
 
-    // 第一阶段：优先寻找显式声明了工具名或 tool_use 类型的对象（避免被内层嵌套参数或前文普通 JSON 误导）
+    // 第一阶段：优先寻找显式声明了工具名或 tool_use 类型的对象
     for (let idx = candidateStarts.length - 1; idx >= 0; idx--) {
       const startPos = candidateStarts[idx];
       try {
-        const { value: parsed } = parsePythonOrJson(cleanContent.slice(startPos));
+        const { value: parsed } = parsePythonOrJson(textToSearch.slice(startPos));
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
           let callName = null;
           let callArgs = null;
@@ -672,6 +683,13 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
             }
           }
 
+          if (callName) {
+            const resolved = adapt.resolveToolName?.(callName, tools) || callName;
+            const matchedTool = adapt.getToolByName?.(resolved, tools) ||
+              tools.find((t) => t.name.toLowerCase() === String(callName).toLowerCase());
+            if (matchedTool) callName = matchedTool.name;
+          }
+
           if (callName && callArgs && typeof callArgs === "object" && !Array.isArray(callArgs)) {
             recoveredCall = {
               id: callId || `toolu_${uuid()}`,
@@ -685,12 +703,12 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
       } catch {}
     }
 
-    // 第二阶段：未找到显式声明时，回退至原有裸 JSON 参数推断（通过 command 或 tools 字段特征）
+    // 第二阶段：未找到显式声明时，回退至原有裸 JSON 参数推断
     if (!recoveredCall) {
       for (let idx = candidateStarts.length - 1; idx >= 0; idx--) {
         const startPos = candidateStarts[idx];
         try {
-          const { value: parsed } = parsePythonOrJson(cleanContent.slice(startPos));
+          const { value: parsed } = parsePythonOrJson(textToSearch.slice(startPos));
           if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
             let inferredToolName = null;
             const paramKeys = Object.keys(parsed);
@@ -723,11 +741,14 @@ async function handleAnthropicMessages(req, res, requestId, originalTargetUrl) {
 
     if (recoveredCall) {
       mergedCalls = [recoveredCall];
-      cleanContent = cleanContent.slice(0, recoveredStartIndex).replace(/```[a-zA-Z0-9_-]*\s*$/, "").trim();
+      cleanContent = textToSearch.slice(0, recoveredStartIndex).replace(/```[a-zA-Z0-9_-]*\s*$/, "").trim();
       log("info", "tool_call.recovered_from_text", {
         toolName: recoveredCall.name,
         arguments: recoveredCall.arguments
       });
+    } else if (sanitizedText && sanitizedText.length > cleanContent.length) {
+      // 兜底容错：如果未识别出任何工具，将 cleanContent 还原为完整正文，防止误截断
+      cleanContent = sanitizedText;
     }
   }
 

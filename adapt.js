@@ -323,15 +323,85 @@ export function compactSchema(schema) {
  *         | { kind:"image" }
  *
  *  【本层核心原则】：
- *  1. 绝不在 JSON 中间下刀，保持 <tool_call> 结构完好，避免模型破损模仿。
- *  2. 排版安全规整：统一 \r\n，安全折叠多余连续空行，不破坏转义符。
- *  3. 命令日志语义萃取：确保保留命令、Exit Code、Traceback、关键报错行。
- *  4. 读写感知与分段保护：同一文件的不同分段读取（offset/range）互补保留，
+ *  1. 物理滑动窗口：保留首条锚点任务与最近 N 轮成对交互，深层老历史彻底丢弃。
+ *  2. 边界合法性保护：杜绝孤儿 tool_result 与角色连续冲突，始终成对。
+ *  3. 绝不在 JSON 中间下刀，保持 <tool_call> 结构完好，避免模型破损模仿。
+ *  4. 排版安全规整：统一 \r\n，安全折叠多余连续空行，不破坏转义符。
+ *  5. 命令日志语义萃取：确保保留命令、Exit Code、Traceback、关键报错行。
+ *  6. 读写感知与分段保护：同一文件的不同分段读取（offset/range）互补保留，
  *     只有文件后续被写入改写，或完全相同的片段重复读取时才判定为陈旧。
- *  5. 梯度衰减：最新工作区全保真，越往历史越进行骨架化。
+ *  7. 梯度衰减：最新工作区全保真，越往历史越进行骨架化。
  * ========================================================================== */
 
 const NOOP_LOG = () => {};
+
+/**
+ * 物理裁剪过早的历史轮次，仅保留初始锚点和最近 N 轮交互，
+ * 确保消息角色交替合法、工具调用与结果成对，彻底解决上下文单调上涨问题。
+ */
+function pruneDeepHistory(messages, tuning, log) {
+  if (!Array.isArray(messages) || messages.length <= 2) {
+    return messages;
+  }
+
+  // 1 轮 = 1 次交互 (一问一答算 1 次，即 2 条消息)，按参数配置计算保留条数
+  const keepTurns = Math.max(1, tuning.keepRecentMessages || 12);
+  const targetRecentCount = keepTurns * 2;
+
+  // 未超过保留窗口 + 初始锚点时，不做物理剔除
+  if (messages.length <= targetRecentCount + 1) {
+    return messages;
+  }
+
+  // 计算初始切分点
+  let cutIndex = messages.length - targetRecentCount;
+
+  // 边界保护 1：避免孤儿 tool_result
+  // 若 cutIndex 处包含 tool_result，说明前置 tool_call 在前面，向前回退成对包含
+  while (cutIndex > 1) {
+    const parts = messages[cutIndex]?.parts || [];
+    const hasToolResult = parts.some((p) => p?.kind === "tool_result");
+    if (!hasToolResult) break;
+    cutIndex--;
+  }
+
+  // 边界保护 2：协议角色严格交替
+  // 确保裁切后的第一条是 assistant（或其他与锚点交替的角色），防止连续两个 user 导致 API 报错
+  const anchorRole = messages[0]?.role || "user";
+  if (cutIndex > 1 && messages[cutIndex]?.role === anchorRole) {
+    cutIndex--;
+  }
+
+  if (cutIndex <= 1) {
+    return messages;
+  }
+
+  const droppedCount = cutIndex - 1;
+  const droppedTurns = Math.max(1, Math.round(droppedCount / 2));
+
+  // 将折叠说明合并到 messages[0] 末尾，既保证提示直达，又绝不产生连续同 role 消息
+  const anchor = messages[0];
+  const foldNotice = {
+    kind: "text",
+    text: `\n\n[系统提示：更早的 ${droppedTurns} 轮工具排查历史已折叠，请结合当前文件状态与 TODO.md 进度直接继续执行]`
+  };
+
+  const modifiedAnchor = {
+    ...anchor,
+    parts: [...(anchor.parts || []), foldNotice]
+  };
+
+  const keptMessages = [modifiedAnchor, ...messages.slice(cutIndex)];
+
+  log("info", "history.pruned", {
+    originalCount: messages.length,
+    prunedCount: droppedCount,
+    prunedTurns: droppedTurns,
+    retainedCount: keptMessages.length
+  });
+
+  return keptMessages;
+}
 
 /**
  * @param {Conversation} convo
@@ -340,11 +410,19 @@ const NOOP_LOG = () => {};
  * @returns {Conversation}
  */
 export function compressHistory(convo, tuning = DEFAULT_TUNING, log = NOOP_LOG) {
-  const messages = Array.isArray(convo?.messages) ? convo.messages : [];
+  const rawMessages = Array.isArray(convo?.messages) ? convo.messages : [];
+  const charsBeforeRaw = rawMessages.reduce(
+    (sum, m) => sum + measureParts(m?.parts),
+    0
+  );
+
+  // 0. 先执行物理滑动窗口：保留首条锚点与最近 N 轮对话
+  const messages = pruneDeepHistory(rawMessages, tuning, log);
   const total = messages.length;
 
   const stats = {
     total,
+    prunedMessages: rawMessages.length - total,
     keptIntact: 0,
     droppedThinking: 0,
     summarizedToolCalls: 0,
@@ -352,7 +430,7 @@ export function compressHistory(convo, tuning = DEFAULT_TUNING, log = NOOP_LOG) 
     truncatedTexts: 0,
     supersededReads: 0,
     collapsedOldMessages: 0,
-    charsBefore: 0,
+    charsBefore: charsBeforeRaw,
     charsAfter: 0
   };
 
@@ -368,7 +446,6 @@ export function compressHistory(convo, tuning = DEFAULT_TUNING, log = NOOP_LOG) 
 
   const compressed = messages.map((msg, index) => {
     const parts = Array.isArray(msg?.parts) ? msg.parts : [];
-    stats.charsBefore += measureParts(parts);
 
     const isTier1 = index >= tier1Start;
     const isTier2 = index >= tier2Start && !isTier1;
@@ -453,7 +530,6 @@ export function compressHistory(convo, tuning = DEFAULT_TUNING, log = NOOP_LOG) 
         // B. 梯度容量上限
         let maxChars = tuning.toolResultMaxChars;
         if (isTier1) {
-          // 当前轮允许较充裕的输出，但对超大刷屏日志依然做安全语义兜底
           maxChars = Math.max(tuning.toolResultMaxChars, 24000);
         } else if (isTier2) {
           maxChars = Math.min(tuning.toolResultMaxChars, 6000);
@@ -463,7 +539,6 @@ export function compressHistory(convo, tuning = DEFAULT_TUNING, log = NOOP_LOG) 
 
         if (maxChars > 0 && text.length > maxChars) {
           stats.truncatedToolResults++;
-          // 采用语义感知截断：保留命令信息、Exit Code、Traceback 与首尾上下文
           text = smartTruncateLog(text, maxChars, "执行结果");
         }
 
@@ -474,13 +549,13 @@ export function compressHistory(convo, tuning = DEFAULT_TUNING, log = NOOP_LOG) 
       next.push(part);
     }
 
-    stats.charsAfter += measureParts(next);
     return { ...msg, parts: next };
   });
 
+  stats.charsAfter = compressed.reduce((sum, msg) => sum + measureParts(msg.parts), 0);
   const result = { ...convo, messages: compressed };
 
-  // 兜底机制：总字符数仍超预算时，从深层历史开始折叠，严格保护 Tier 1 工作区
+  // 兜底机制：总字符数仍超预算时，从深层历史开始折叠
   if (tuning.maxTotalChars > 0 && stats.charsAfter > tuning.maxTotalChars) {
     result.messages = shrinkToBudgetSafely(
       compressed,
@@ -506,7 +581,6 @@ export function compressHistory(convo, tuning = DEFAULT_TUNING, log = NOOP_LOG) 
  * 考虑每次读一部分的情况（通过 offset / limit / lines 区分分段）。
  */
 function analyzeFileOperations(messages) {
-  // key: filePath -> { lastWriteIndex, reads: Array<{ index, sliceKey, partId }> }
   const files = new Map();
 
   for (let i = 0; i < messages.length; i++) {
@@ -541,10 +615,6 @@ function extractFilePath(args) {
   return typeof p === "string" ? p.trim() : "";
 }
 
-/**
- * 提炼分段读取的标识（offset, limit, start_line 等）。
- * 若无分片参数，则视为完整读取 "full"。
- */
 function extractSliceKey(args) {
   if (!args || typeof args !== "object") return "full";
   const offset = args.offset ?? args.start ?? args.start_line ?? args.line_start ?? "";
@@ -579,25 +649,33 @@ function isWriteTool(name) {
 }
 
 /**
- * 判定某个 tool_result 是否为已过时或被改写的文件内容：
- * 1. 如果该文件在后续轮次发生了写入操作，前面的读取内容全部陈旧。
- * 2. 如果后续存在对“同一文件同一分段（sliceKey）”的重复读取，则当前早期的这笔读取陈旧。
- * 3. 不同的分段读取互不判定为陈旧（互补保留）。
+ * 判定某个 tool_result 是否为已过时或被改写的文件内容
  */
 function isStaleFileRead(resultPart, msgIndex, fileStateMap) {
-  // 通过 tool_result 的关联名字或 id 识别
   const partName = String(resultPart.name || "");
-  if (!isReadTool(partName)) return false;
+  const hasReadName = isReadTool(partName);
 
-  for (const [filePath, info] of fileStateMap.entries()) {
-    // 命中后续有写入：直接作废
+  // 兼容保护：若 resultPart 未携带 name，但其 id 曾对应读取调用，也视为读取
+  let isKnownReadId = false;
+  if (!hasReadName && resultPart.id) {
+    for (const info of fileStateMap.values()) {
+      if (info.reads.some((r) => r.id === resultPart.id)) {
+        isKnownReadId = true;
+        break;
+      }
+    }
+  }
+
+  if (!hasReadName && !isKnownReadId) return false;
+
+  for (const [, info] of fileStateMap.entries()) {
     if (info.lastWriteIndex > msgIndex) {
-      // 简单根据 text 是否包含该文件名或记录中的读引用
-      const readRef = info.reads.find((r) => r.index === msgIndex || (resultPart.id && r.id === resultPart.id));
+      const readRef = info.reads.find(
+        (r) => r.index === msgIndex || (resultPart.id && r.id === resultPart.id)
+      );
       if (readRef) return true;
     }
 
-    // 命中重复读相同分段：如果后面还有相同的 sliceKey 读取，说明本条已被刷新
     const readIndices = info.reads.filter(
       (r) => r.index === msgIndex || (resultPart.id && r.id === resultPart.id)
     );
@@ -613,9 +691,6 @@ function isStaleFileRead(resultPart, msgIndex, fileStateMap) {
   return false;
 }
 
-/**
- * 将历史深层的写入调用骨架化，保持字段结构合法。
- */
 function skeletonizeWriteArgs(args) {
   if (!args || typeof args !== "object") return args;
   const nextArgs = { ...args };
@@ -634,13 +709,6 @@ function skeletonizeWriteArgs(args) {
 
 /* ---------------------------- 日志语义萃取与格式处理 ---------------------------- */
 
-/**
- * 安全规整排版：
- * - 统一 \r\n -> \n
- * - 清理行尾多余的无意义空格
- * - 连续 3 个及以上换行收敛为 2 个换行
- * 严格保护代码内容与所有转义符号，杜绝 Token 浪费。
- */
 export function sanitizeWhitespace(text) {
   if (!text || typeof text !== "string") return "";
   return text
@@ -650,23 +718,16 @@ export function sanitizeWhitespace(text) {
     .replace(/\n{3,}/g, "\n\n");
 }
 
-/**
- * 语义感知型日志截断：
- * 优先保护：执行命令、退出码 (Exit Code)、测试统计 (Pass/Fail)、Traceback / 编译异常。
- */
 export function smartTruncateLog(text, limit, label = "日志") {
   if (text.length <= limit) return text;
 
-  // 1. 保留头部（约 25% 配额）：获取执行命令与初始上下文
   const headSize = Math.max(300, Math.floor(limit * 0.25));
-  // 2. 保留尾部（约 30% 配额）：获取退出码、统计汇总行、最新状态
   const tailSize = Math.max(400, Math.floor(limit * 0.3));
 
   const headPart = text.slice(0, headSize);
   const tailPart = text.slice(-tailSize);
   const middleContent = text.slice(headSize, -tailSize);
 
-  // 3. 在中间部分扫描关键错误信号（Traceback, Error, FAIL, Exit code 等）
   const middleSignals = extractLogSignals(middleContent, limit - headSize - tailSize);
 
   if (middleSignals) {
@@ -677,9 +738,6 @@ export function smartTruncateLog(text, limit, label = "日志") {
   return `${headPart}\n\n...[${label}已省略 ${removed} 字符]...\n\n${tailPart}`;
 }
 
-/**
- * 从长日志中间提取有价值的错误特征行及上下文
- */
 function extractLogSignals(middleText, budget) {
   if (budget <= 300 || !middleText) return "";
 
@@ -702,12 +760,10 @@ function extractLogSignals(middleText, budget) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (errorIndicators.some((regex) => regex.test(line))) {
-      // 捕获前 2 行与后 3 行的上下文
       const start = Math.max(0, i - 2);
       const end = Math.min(lines.length - 1, i + 3);
       for (let j = start; j <= end; j++) matchedLineIndices.add(j);
     }
-    // 捕获行数有上限，避免错误自身过大
     if (matchedLineIndices.size > 80) break;
   }
 
@@ -721,7 +777,6 @@ function extractLogSignals(middleText, budget) {
   return extracted.length > budget ? extracted.slice(0, budget) + "\n..." : extracted;
 }
 
-/** 头尾截断兜底函数 */
 export function middleTruncate(text, limit, label) {
   if (text.length <= limit) return text;
 
@@ -737,15 +792,10 @@ export function middleTruncate(text, limit, label) {
 
 /* ---------------------------- 预算硬控制与折叠 ---------------------------- */
 
-/**
- * 带有“最新工作区保护”的安全预算收缩机制：
- * 绝不允许折叠 protectFrom 之后的最近消息。
- */
 function shrinkToBudgetSafely(messages, protectFrom, budget, stats) {
   const result = [...messages];
   let current = result.reduce((sum, msg) => sum + measureParts(msg.parts), 0);
 
-  // 第一步：从最老的消息开始，折叠深层历史
   for (let index = 0; index < protectFrom && current > budget; index++) {
     const parts = result[index]?.parts || [];
     if (!parts.length) continue;
@@ -763,7 +813,6 @@ function shrinkToBudgetSafely(messages, protectFrom, budget, stats) {
     stats.collapsedOldMessages++;
   }
 
-  // 第二步：如果深层历史已折叠完毕仍然超标，在保护区之外适度紧缩非文本大块
   if (current > budget) {
     for (let index = 0; index < protectFrom && current > budget; index++) {
       const parts = result[index]?.parts || [];
@@ -795,9 +844,6 @@ function describeParts(parts) {
   return names.join("、") || "空";
 }
 
-/**
- * 递归省略过长的参数值，但保持参数结构完整。
- */
 function elideLongArgValues(args, limit) {
   const walk = (value) => {
     if (typeof value === "string") {
